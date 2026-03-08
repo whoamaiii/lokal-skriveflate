@@ -31,7 +31,19 @@ import { Sidebar } from "./components/Sidebar";
 import { EditorPane, type EditorPaneHandle } from "./components/EditorPane";
 import { ChatPane } from "./components/ChatPane";
 import { ActionPreview } from "./components/ActionPreview";
+import {
+  FloatingNav,
+  type NavSection,
+} from "./components/FloatingNav";
+import {
+  THEME_STORAGE_KEY,
+  applyTheme,
+  getInitialTheme,
+  type ThemeMode,
+} from "./lib/theme";
 import { StatusStrip } from "./components/StatusStrip";
+
+const MOBILE_NAV_BREAKPOINT = "(max-width: 1180px)";
 
 function updateStoredDocument(
   document: StoredDocument,
@@ -64,7 +76,16 @@ export default function App() {
   const [lastExportPath, setLastExportPath] = useState<string | null>(null);
   const [runtimeNotice, setRuntimeNotice] = useState<string | null>(null);
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
+  const [activeNav, setActiveNav] = useState<NavSection>("search");
+  const [themeMode, setThemeMode] = useState<ThemeMode>(getInitialTheme);
+  const [isThemeAnimating, setIsThemeAnimating] = useState(false);
   const editorRef = useRef<EditorPaneHandle | null>(null);
+  const sectionRefs = useRef<Record<NavSection, HTMLElement | null>>({
+    home: null,
+    search: null,
+    user: null,
+  });
+  const themeAnimationTimeoutRef = useRef<number | null>(null);
 
   const activeDocument = workspace?.active_document ?? null;
 
@@ -79,6 +100,19 @@ export default function App() {
   useEffect(() => {
     void bootstrap();
   }, [bootstrap]);
+
+  useEffect(() => {
+    applyTheme(themeMode);
+    window.localStorage.setItem(THEME_STORAGE_KEY, themeMode);
+  }, [themeMode]);
+
+  useEffect(() => {
+    return () => {
+      if (themeAnimationTimeoutRef.current) {
+        window.clearTimeout(themeAnimationTimeoutRef.current);
+      }
+    };
+  }, []);
 
   const persistDocument = useEffectEvent(async (nextDocument: SaveDocumentInput) => {
     const saved = await saveDocument(nextDocument);
@@ -126,6 +160,25 @@ export default function App() {
   const wordCount = activeDocument?.plain_text.trim()
     ? activeDocument.plain_text.trim().split(/\s+/).length
     : 0;
+
+  const activateNavSection = useEffectEvent((section: NavSection, shouldScrollIntoView = false) => {
+    setActiveNav(section);
+
+    if (!shouldScrollIntoView || !window.matchMedia(MOBILE_NAV_BREAKPOINT).matches) {
+      return;
+    }
+
+    const target = sectionRefs.current[section];
+    if (!target) {
+      return;
+    }
+
+    const prefersReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    target.scrollIntoView({
+      behavior: prefersReducedMotion ? "auto" : "smooth",
+      block: "start",
+    });
+  });
 
   async function handleCreateDocument() {
     const snapshot = await createDocument();
@@ -356,9 +409,23 @@ export default function App() {
     }
   }
 
+  function handleThemeToggle() {
+    if (themeAnimationTimeoutRef.current) {
+      window.clearTimeout(themeAnimationTimeoutRef.current);
+    }
+
+    setThemeMode((currentTheme) => (currentTheme === "dark" ? "light" : "dark"));
+    setIsThemeAnimating(true);
+
+    themeAnimationTimeoutRef.current = window.setTimeout(() => {
+      setIsThemeAnimating(false);
+      themeAnimationTimeoutRef.current = null;
+    }, 620);
+  }
+
   if (isLoading || !workspace || !activeDocument) {
     return (
-      <main className="loading-screen">
+      <main className="loading-screen" data-theme={themeMode}>
         <div className="loading-card">
           <p className="eyebrow">Starter lokal arbeidsflate</p>
           <h1>Setter opp dokumenter, lokal lagring og agentbro</h1>
@@ -368,87 +435,112 @@ export default function App() {
   }
 
   return (
-    <main className="app-shell">
-      <Sidebar
-        activeDocumentId={activeDocument.id}
-        documents={workspace.documents}
-        onCreateDocument={handleCreateDocument}
-        onSelectDocument={handleOpenDocument}
-        workflows={workspace.workflow_modules}
-      />
-
-      <section className="workspace-panel">
-        <header className="workspace-header">
-          <div>
-            <p className="eyebrow">Aktivt dokument</p>
-            <input
-              className="document-title-input"
-              onChange={(event) => handleTitleChange(event.target.value)}
-              value={activeDocument.title}
-            />
-          </div>
-          <div className="workspace-actions">
-            <button className="ghost-button" onClick={handleRefreshRuntime} type="button">
-              <RefreshCcw size={15} />
-              Oppdater status
-            </button>
-            <button className="ghost-button" onClick={() => handleExport("html")} type="button">
-              <Download size={15} />
-              HTML
-            </button>
-            <button className="ghost-button" onClick={() => handleExport("pdf")} type="button">
-              <Download size={15} />
-              PDF
-            </button>
-            <button className="ghost-button" onClick={() => handleExport("txt")} type="button">
-              <Save size={15} />
-              TXT
-            </button>
-          </div>
-        </header>
-
-        <div className="workspace-meta">
-          <span>{wordCount} ord</span>
-          <span>{activeDocument.snapshot_count} snapshots</span>
-          <span>{selectionText ? `${selectionText.length} tegn markert` : "Ingen tekst markert"}</span>
-          {lastExportPath ? <span className="export-path">Sist eksportert til {lastExportPath}</span> : null}
-        </div>
-
-        <EditorPane
-          document={activeDocument}
-          onContentChange={handleDocumentContent}
-          onSelectionChange={setSelectionText}
-          ref={editorRef}
+    <>
+      <main className="app-shell" data-active-nav={activeNav} data-theme={themeMode}>
+        <Sidebar
+          activeDocumentId={activeDocument.id}
+          documents={workspace.documents}
+          onActivate={() => activateNavSection("home")}
+          onCreateDocument={handleCreateDocument}
+          onSelectDocument={handleOpenDocument}
+          panelRef={(node) => {
+            sectionRefs.current.home = node;
+          }}
+          workflows={workspace.workflow_modules}
         />
 
-        {pendingAction ? (
-          <ActionPreview
-            action={pendingAction}
-            onApply={handleApplyAction}
-            onDismiss={() => setPendingAction(null)}
+        <section
+          className="workspace-panel app-section app-section-search"
+          onFocusCapture={() => activateNavSection("search")}
+          onPointerDownCapture={() => activateNavSection("search")}
+          ref={(node) => {
+            sectionRefs.current.search = node;
+          }}
+        >
+          <header className="workspace-header">
+            <div>
+              <p className="eyebrow">Aktivt dokument</p>
+              <input
+                className="document-title-input"
+                onChange={(event) => handleTitleChange(event.target.value)}
+                value={activeDocument.title}
+              />
+            </div>
+            <div className="workspace-actions">
+              <button className="ghost-button" onClick={handleRefreshRuntime} type="button">
+                <RefreshCcw size={15} />
+                Oppdater status
+              </button>
+              <button className="ghost-button" onClick={() => handleExport("html")} type="button">
+                <Download size={15} />
+                HTML
+              </button>
+              <button className="ghost-button" onClick={() => handleExport("pdf")} type="button">
+                <Download size={15} />
+                PDF
+              </button>
+              <button className="ghost-button" onClick={() => handleExport("txt")} type="button">
+                <Save size={15} />
+                TXT
+              </button>
+            </div>
+          </header>
+
+          <div className="workspace-meta">
+            <span>{wordCount} ord</span>
+            <span>{activeDocument.snapshot_count} snapshots</span>
+            <span>{selectionText ? `${selectionText.length} tegn markert` : "Ingen tekst markert"}</span>
+            {lastExportPath ? <span className="export-path">Sist eksportert til {lastExportPath}</span> : null}
+          </div>
+
+          <EditorPane
+            document={activeDocument}
+            onContentChange={handleDocumentContent}
+            onSelectionChange={setSelectionText}
+            ref={editorRef}
           />
-        ) : null}
 
-        <StatusStrip runtimeStatus={workspace.runtime_status} />
-      </section>
+          {pendingAction ? (
+            <ActionPreview
+              action={pendingAction}
+              onApply={handleApplyAction}
+              onDismiss={() => setPendingAction(null)}
+            />
+          ) : null}
 
-      <ChatPane
-        isSending={isSending}
-        isRuntimeActionPending={isRuntimeActionPending}
-        messages={activeDocument.messages}
-        onActivateModel={(modelId) => void handleModelChange(modelId)}
-        onPrepareLocalAi={() => void handleSetupAction("prepare")}
-        onPromptChange={setPrompt}
-        onQuickAction={(actionId) => void handleSend(actionId)}
-        onRepairLocalAi={() => void handleSetupAction("repair")}
-        onSend={() => void handleSend()}
-        onToneChange={(value) => void handleToneChange(value)}
-        prompt={prompt}
-        runtimeError={runtimeError}
-        runtimeNotice={runtimeNotice}
-        runtimeStatus={workspace.runtime_status}
-        tone={workspace.settings.preferred_tone}
+          <StatusStrip runtimeStatus={workspace.runtime_status} />
+        </section>
+
+        <ChatPane
+          isSending={isSending}
+          isRuntimeActionPending={isRuntimeActionPending}
+          messages={activeDocument.messages}
+          onActivate={() => activateNavSection("user")}
+          onActivateModel={(modelId) => void handleModelChange(modelId)}
+          onPrepareLocalAi={() => void handleSetupAction("prepare")}
+          onPromptChange={setPrompt}
+          onQuickAction={(actionId) => void handleSend(actionId)}
+          onRepairLocalAi={() => void handleSetupAction("repair")}
+          onSend={() => void handleSend()}
+          onToneChange={(value) => void handleToneChange(value)}
+          panelRef={(node) => {
+            sectionRefs.current.user = node;
+          }}
+          prompt={prompt}
+          runtimeError={runtimeError}
+          runtimeNotice={runtimeNotice}
+          runtimeStatus={workspace.runtime_status}
+          tone={workspace.settings.preferred_tone}
+        />
+      </main>
+
+      <FloatingNav
+        activeNav={activeNav}
+        isThemeAnimating={isThemeAnimating}
+        onSelectNav={(section) => activateNavSection(section, true)}
+        onToggleTheme={handleThemeToggle}
+        themeMode={themeMode}
       />
-    </main>
+    </>
   );
 }

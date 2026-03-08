@@ -6,6 +6,15 @@
       name="viewport"
       content="width=device-width, initial-scale=1.0"
     />
+    <script>
+      (() => {
+        const themeKey = "lokal-skriveflate-theme";
+        const theme = localStorage.getItem(themeKey);
+        const resolvedTheme = theme === "light" || theme === "dark" ? theme : "dark";
+        document.documentElement.dataset.theme = resolvedTheme;
+        document.documentElement.style.colorScheme = resolvedTheme;
+      })();
+    </script>
     <title>Lokal Skriveflate</title>
   </head>
   <body>

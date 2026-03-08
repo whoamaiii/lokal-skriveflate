@@ -1,3 +1,4 @@
+import type { Ref } from "react";
 import { FilePlus2, Sparkles, Workflow } from "lucide-react";
 import type { DocumentSummary, WorkflowModule } from "../types";
 
@@ -7,6 +8,8 @@ interface SidebarProps {
   workflows: WorkflowModule[];
   onCreateDocument: () => void;
   onSelectDocument: (documentId: string) => void;
+  onActivate?: () => void;
+  panelRef?: Ref<HTMLElement>;
 }
 
 export function Sidebar({
@@ -15,9 +18,16 @@ export function Sidebar({
   workflows,
   onCreateDocument,
   onSelectDocument,
+  onActivate,
+  panelRef,
 }: SidebarProps) {
   return (
-    <aside className="sidebar-panel">
+    <aside
+      className="sidebar-panel app-section app-section-home"
+      onFocusCapture={onActivate}
+      onPointerDownCapture={onActivate}
+      ref={panelRef}
+    >
       <div className="sidebar-header">
         <div>
           <p className="eyebrow">Offline skriveflate</p>

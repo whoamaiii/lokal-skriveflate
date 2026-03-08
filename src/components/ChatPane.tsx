@@ -1,3 +1,4 @@
+import type { Ref } from "react";
 import { AlertTriangle, LoaderCircle, Play, RefreshCcw, Rocket, WandSparkles } from "lucide-react";
 import type { ChatMessage, RuntimeStatus } from "../types";
 
@@ -26,6 +27,8 @@ interface ChatPaneProps {
   onPrepareLocalAi: () => void;
   onRepairLocalAi: () => void;
   onActivateModel: (modelId: string) => void;
+  onActivate?: () => void;
+  panelRef?: Ref<HTMLElement>;
 }
 
 export function ChatPane({
@@ -44,6 +47,8 @@ export function ChatPane({
   onPrepareLocalAi,
   onRepairLocalAi,
   onActivateModel,
+  onActivate,
+  panelRef,
 }: ChatPaneProps) {
   const modelReady =
     runtimeStatus.codex.available &&
@@ -67,7 +72,12 @@ export function ChatPane({
   })();
 
   return (
-    <aside className="chat-panel">
+    <aside
+      className="chat-panel app-section app-section-user"
+      onFocusCapture={onActivate}
+      onPointerDownCapture={onActivate}
+      ref={panelRef}
+    >
       <div className="chat-header">
         <div>
           <p className="eyebrow">Lokal skriveassistent</p>
