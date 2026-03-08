@@ -9,6 +9,7 @@ import type {
   RuntimeActionResult,
   SaveDocumentInput,
   RuntimeStatus,
+  StoredDocument,
   WorkspaceSnapshot,
 } from "../types";
 
@@ -25,7 +26,7 @@ export function openDocument(documentId: string) {
 }
 
 export function saveDocument(document: SaveDocumentInput) {
-  return invoke("save_document", { request: document });
+  return invoke<StoredDocument>("save_document", { request: document });
 }
 
 export function sendAssistantTurn(request: AssistantTurnInput) {
