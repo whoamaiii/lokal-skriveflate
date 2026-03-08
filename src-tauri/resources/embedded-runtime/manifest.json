@@ -1,0 +1,30 @@
+{
+  "engine": {
+    "resource": "embedded-runtime/bin/llama-server",
+    "target_name": "llama-server",
+    "sha256": "59f24b9a4bf924a4c7de39aa2357ccfb9a9f20b17fa45e64e50da27ef9e8ff30",
+    "placeholder": true
+  },
+  "models": [
+    {
+      "id": "qwen3-4b-instruct-q4_k_m",
+      "label": "Qwen3-4B-Instruct Q4_K_M",
+      "tier": "Standard",
+      "resource": "embedded-runtime/models/qwen3-4b-instruct-q4_k_m.gguf",
+      "filename": "qwen3-4b-instruct-q4_k_m.gguf",
+      "sha256": "d9e714c499873ce224dbeb0933239a508de4c92db9540a5d024243d4c0b7f82c",
+      "bundled": true,
+      "placeholder": true
+    },
+    {
+      "id": "qwen3-8b-instruct-q4_k_m",
+      "label": "Qwen3-8B-Instruct Q4_K_M",
+      "tier": "Bedre kvalitet",
+      "resource": "embedded-runtime/models/qwen3-8b-instruct-q4_k_m.gguf",
+      "filename": "qwen3-8b-instruct-q4_k_m.gguf",
+      "sha256": "b293553327a04ee0d192ef0d1836c73181f0beea1907759527125a979e287dda",
+      "bundled": false,
+      "placeholder": true
+    }
+  ]
+}

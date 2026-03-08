@@ -1,0 +1,5 @@
+#!/bin/sh
+echo "Denne utviklerbyggen har ikke ekte llama.cpp bundlede artefakter enda."
+echo "Erstatt src-tauri/resources/embedded-runtime/bin/llama-server med en faktisk llama.cpp-serverbinar,"
+echo "eller sett LOKAL_AI_BINARY_PATH til en lokal llama-server før du starter appen."
+exit 78
