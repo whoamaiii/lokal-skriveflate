@@ -172,7 +172,7 @@ export const EditorPane = forwardRef<EditorPaneHandle, EditorPaneProps>(function
       return;
     }
 
-    editor.commands.setContent(document.content, false);
+    editor.commands.setContent(document.content, { emitUpdate: false });
     onSelectionChange("");
   }, [document.id, editor, onSelectionChange]);
 
