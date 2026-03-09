@@ -1,0 +1,39 @@
+mindmap
+  root((localdocumentasjon))
+    Frontend
+      "App shell\nsrc/App.tsx"
+      "Assistant UI\nsrc/components/ChatPane.tsx"
+      "Editor apply path\nsrc/components/EditorPane.tsx"
+      "Preview tray\nsrc/components/ActionPreview.tsx"
+      "Browser fallback\nsrc/lib/browserPreview.ts"
+    Backend
+      "Tauri wiring\nsrc-tauri/src/lib.rs"
+      "Command layer\nsrc-tauri/src/commands.rs"
+      "Storage + export\nsrc-tauri/src/storage.rs"
+      "Agent orchestration\nsrc-tauri/src/agent/mod.rs"
+      "Runtime lifecycle\nsrc-tauri/src/agent/local_model.rs"
+      "Codex bridge\nsrc-tauri/src/agent/codex_bridge.rs"
+    Verification
+      "Frontend tests\nsrc/App.test.tsx"
+      "Component tests\nsrc/components/*.test.tsx"
+      "Bridge tests\nsrc/lib/tauri.test.ts"
+      "Rust tests\nsrc-tauri/src/storage.rs"
+      "CI\n.github/workflows/ci.yml"
+    Fixes
+      DONE
+        "Atomic local storage + corruption quarantine\nsrc-tauri/src/storage.rs"
+        "Preview-before-apply contract\nsrc/App.tsx + src/components/ActionPreview.tsx"
+        "Document revision conflict guard\nsrc-tauri/src/commands.rs"
+        "HTML export sanitization + PDF export\nsrc-tauri/src/storage.rs + src-tauri/src/export.rs"
+      IN_PROGRESS
+        "Prototype embedded runtime flow\nsrc-tauri/src/agent/local_model.rs + src-tauri/resources/embedded-runtime/manifest.json"
+        "Desktop and browser-preview parity\nsrc/lib/tauri.ts + src/lib/browserPreview.ts"
+        "Workflow placeholders\nsrc/components/Sidebar.tsx + src-tauri/src/models.rs"
+      TODO
+        "Replace placeholder llama/model assets with real release artifacts\nsrc-tauri/resources/embedded-runtime/manifest.json"
+        "Bundle Codex or remove external codex dependency\nsrc-tauri/src/agent/codex_bridge.rs"
+        "Allow sends from degraded state\nsrc/components/ChatPane.tsx"
+        "Persist previews per document instead of dropping on navigation\nsrc/App.tsx"
+        "Fix Vitest startup config failure\nvitest.config.ts"
+        "Add runtime/bridge/integration coverage\nsrc-tauri/src/agent/* + src/components/EditorPane.tsx"
+        "Add app shutdown cleanup for managed llama child\nsrc-tauri/src/lib.rs + src-tauri/src/agent/local_model.rs"

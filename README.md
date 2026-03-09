@@ -1,18 +1,17 @@
 # Lokal Skriveflate
 
-En offline-first Mac-prototype for dokumentskriving med lokal AI, inspirert av Codex-opplevelsen men bygget som egen Tauri-app.
+En Apple Silicon-only, offline-first macOS skriveflate for lokal AI-assistanse med preview-before-apply som hovedregel.
 
 ## Hva som er med
 
-- Tauri 2 desktop-app for macOS
+- Tauri 2 desktop-app for Apple Silicon macOS
 - React + TipTap editor med dokument og chat side om side
 - Lokal filbasert lagring av dokumenter, meldinger, settings og snapshots
 - Codex `app-server`-bro via `stdio`
 - Bundlet lokal runtime-arkitektur for `llama.cpp` med førsteoppstarts-klargjøring
-- Modellkatalog med `Qwen3-4B-Instruct Q4_K_M` som standard og `Qwen3-8B-Instruct Q4_K_M` som valgfri kvalitets-pakke
+- Én velsignet modellbane for `Neurologg Q4_K_M`
 - AI-kontrakt der alle dokumentendringer returneres som preview før innsetting
 - Eksport til HTML, TXT og enkel PDF
-- Planlagte workflow-plassholdere for rapport, logg og prosjekt
 
 ## Kjør lokalt
 
@@ -24,49 +23,61 @@ npm install
 ## Verifiser lokalt
 
 ```bash
-npm run typecheck
-npm test
-npm run build
-cargo check --manifest-path src-tauri/Cargo.toml
-cargo test --manifest-path src-tauri/Cargo.toml
+npm run verify:frontend
+npm run verify:backend
 ```
 
 ## Bygg app
 
 ```bash
-./node_modules/.bin/vite build
-./node_modules/.bin/tauri build --debug --bundles app
+LOKAL_RELEASE_CODEX_SOURCE="/full/path/to/codex-aarch64-apple-darwin" \
+LOKAL_RELEASE_LLAMA_SOURCE="/full/path/to/llama-server" \
+LOKAL_RELEASE_MODEL_SOURCE="/full/path/to/neurologg-q4_k_m.gguf" \
+npm run prepare:release-assets
+
+npm run tauri:build -- --bundles app
 ```
 
 Den ferdige `.app`-pakken havner under:
 
 ```text
-src-tauri/target/debug/bundle/macos/Lokal Skriveflate.app
+src-tauri/target/release/bundle/macos/Lokal Skriveflate.app
 ```
 
 ## Lokal AI-stack
 
-Appen forventer:
+- bundlet Codex-sidecar
+- bundlet `llama-server`-sidecar
+- én bundlet modell
+- ingen host-installert Codex i release-behavior
+- `llama.cpp`-dylibs blir staged under `src-tauri/resources/embedded-runtime/staged/lib/`
+- `npm run tauri:build` synkroniserer disse bibliotekene inn i `.app`-pakken under `Contents/lib`
 
-- `codex` tilgjengelig på maskinen
-- en lokal OpenAI-kompatibel `llama.cpp`-serverbinar pakket som appressurs eller pekt inn via miljøvariabel
-- en lokal GGUF-modell for standardsporet `qwen3-4b-instruct-q4_k_m`
+Se også:
 
-Denne repoen inneholder:
+- [v1 execution brief](./docs/v1-execution-brief.md)
+- [runtime contract](./docs/runtime-contract.md)
+- [feasibility go/no-go](./docs/feasibility-go-no-go.md)
+- [release checklist](./docs/release-checklist.md)
 
-- et bundlet runtime-manifest i `src-tauri/resources/embedded-runtime/manifest.json`
-- placeholder-filer som lar appen bygge og pakke rent
-- støtte for å erstatte placeholderne med ekte artefakter uten kodeendringer
-
-For lokal test med ekte filer kan du sette:
+For lokal staging med ekte filer:
 
 ```bash
-export LOKAL_AI_BINARY_PATH="/full/path/to/llama-server"
-export LOKAL_AI_STANDARD_MODEL_PATH="/full/path/to/qwen3-4b-instruct-q4_k_m.gguf"
-export LOKAL_AI_QUALITY_MODEL_PATH="/full/path/to/qwen3-8b-instruct-q4_k_m.gguf"
+export LOKAL_RELEASE_CODEX_SOURCE="/full/path/to/codex-aarch64-apple-darwin"
+export LOKAL_RELEASE_LLAMA_SOURCE="/full/path/to/llama-server"
+export LOKAL_RELEASE_MODEL_SOURCE="/full/path/to/neurologg-q4_k_m.gguf"
+npm run prepare:release-assets
 ```
 
-Når appen startes og du trykker `Klargjør lokal AI`, kopieres disse filene inn i appens lokale runtime-mappe under `~/Library/Application Support/no.quentin.lokalskriveflate/runtime/<versjon>/`.
+I debug-bygg kan du fortsatt bruke utvikler-overstyringer:
+
+```bash
+export LOKAL_AI_CODEX_PATH="/full/path/to/codex"
+export LOKAL_AI_BINARY_PATH="/full/path/to/llama-server"
+export LOKAL_AI_MODEL_PATH="/full/path/to/neurologg-q4_k_m.gguf"
+```
+
+I release-behavior skal appen bruke de bundlete sidecarene og den bundlete modellen.
 
 ## Gjenoppretting fra korrupt lokal lagring
 
@@ -80,7 +91,7 @@ Appen fortsetter oppstarten med de friske dokumentene som finnes og viser en gje
 
 ## Manuell validering av `.app`-pakken
 
-Bruk den faktiske `.app`-pakken under `src-tauri/target/debug/bundle/macos/Lokal Skriveflate.app`, ikke bare `tauri dev`, når du går gjennom denne sjekklista.
+Bruk den faktiske `.app`-pakken under `src-tauri/target/release/bundle/macos/Lokal Skriveflate.app`, ikke bare `tauri dev`, når du går gjennom denne sjekklista.
 
 For scenarier som avhenger av lagringsstatus, start med en ren app-data-mappe:
 
@@ -96,15 +107,18 @@ Sjekkliste for close-out:
 4. Lag et AI-preview, rediger dokumentet videre og prøv å bruke previewet. Previewet skal markeres som utdatert og ikke kunne brukes.
 5. Ødelegg én dokument-JSON manuelt og start appen på nytt. Appen skal åpne, flytte fila til `corrupt/` og vise gjenopprettingsmelding.
 6. Ødelegg `app-state.json` manuelt og start appen på nytt. Appen skal gjenopprette standardtilstand, velge et friskt dokument og vise gjenopprettingsmelding.
-7. Kjør lokal AI-oppsett med bare standardmodellen tilgjengelig. Oppsettet skal lykkes uten at kvalitetsmodellen finnes.
+7. Kjør lokal AI-oppsett med bare standardmodellen tilgjengelig. Oppsettet skal lykkes uten å forvente ekstra modellpakker.
 8. Tving gjentatte start- eller reparasjonsfeil i lokal runtime. Appen skal kunne prøve igjen uten hengende hjelpeprosesser.
 9. Eksporter HTML fra et dokument som inneholder `<script>` i tittel eller innhold. Den eksporterte fila skal ikke kjøre skript.
 10. Eksporter et tomt dokument til PDF. Resultatet skal være en gyldig PDF med én tom side.
 
-## Begrensninger i denne prototypen
+## Begrensninger akkurat nå
 
-- DMG-bundling er ikke ferdigstabilisert; `.app`-bundle bygger rent, men skal fortsatt kjøres gjennom sjekklista over før release
-- Repoen ships med placeholder-artefakter for runtime/modell fordi ekte Qwen3/llama.cpp-filer er for store til å ligge i kildekoden
+- Packaged `.app` build, primær oppstart og headless packaged assistant-turn smoke er verifisert på primærmaskinen
+- Gjentatt packaged smoke etter clean reset er dokumentert, men full GUI-walkthrough på en andre clean environment er fortsatt ikke kjørt
+- Denne maskinen mangler gyldig codesigning-identitet og notariseringssteg
+- Andre clean-environment / second-machine-bevis er fortsatt ikke kjørt
+- Ekte release-artefakter er staged lokalt, men er ikke ment å ligge versjonert i repoen
 - DOCX import/eksport er ikke implementert
-- Rapport/logg/prosjekt er planlagte moduler, ikke ferdige workflows
-- macOS er det validerte målmiljøet i denne repoen; andre plattformer er ikke en del av den nåværende release-støtten
+- Rapport/logg/prosjekt er ikke del av funksjonell v1-scope
+- Intel/universal builds er ikke del av v1
