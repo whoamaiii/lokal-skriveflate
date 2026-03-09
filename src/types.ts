@@ -29,6 +29,20 @@ export interface EditorAction {
   content: string;
 }
 
+export interface EditorSelection {
+  text: string;
+  from: number;
+  to: number;
+}
+
+export interface PendingActionPreview {
+  action: EditorAction;
+  document_id: string;
+  document_revision: number;
+  selection_from: number;
+  selection_to: number;
+}
+
 export interface DocumentSummary {
   id: string;
   title: string;
@@ -42,6 +56,7 @@ export interface StoredDocument extends DocumentSummary {
   plain_text: string;
   html: string;
   content: JSONContent;
+  content_revision: number;
   thread_id: string | null;
   messages: ChatMessage[];
   snapshot_count: number;
@@ -93,11 +108,13 @@ export interface AppBootstrap {
   runtime_status: RuntimeStatus;
   settings: AppSettings;
   workflow_modules: WorkflowModule[];
+  recovery_notices: string[];
 }
 
 export interface WorkspaceSnapshot {
   documents: DocumentSummary[];
   active_document: StoredDocument;
+  recovery_notices: string[];
 }
 
 export interface SaveDocumentInput {
@@ -110,6 +127,7 @@ export interface SaveDocumentInput {
 
 export interface AssistantTurnInput {
   document_id: string;
+  document_revision: number;
   prompt: string;
   quick_action: string | null;
   tone: string;

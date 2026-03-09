@@ -1,4 +1,4 @@
-import { forwardRef, useEffect, useImperativeHandle } from "react";
+import { forwardRef, useEffect, useEffectEvent, useImperativeHandle } from "react";
 import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import Underline from "@tiptap/extension-underline";
@@ -7,29 +7,28 @@ import { Table } from "@tiptap/extension-table";
 import TableRow from "@tiptap/extension-table-row";
 import TableCell from "@tiptap/extension-table-cell";
 import TableHeader from "@tiptap/extension-table-header";
-import {
-  Bold,
-  Heading1,
-  Heading2,
-  Italic,
-  List,
-  Pilcrow,
-  Quote,
-  Table2,
-  Underline as UnderlineIcon,
-  type LucideIcon,
-} from "lucide-react";
 import type { Editor, JSONContent } from "@tiptap/core";
-import type { EditorAction, StoredDocument } from "../types";
+import type {
+  EditorSelection,
+  PendingActionPreview,
+  StoredDocument,
+} from "../types";
+import {
+  toolbarActions,
+  type ToolbarActionId,
+} from "./editorToolbar";
 
 export interface EditorPaneHandle {
-  applyAction: (action: EditorAction) => void;
+  applyAction: (preview: PendingActionPreview) => void;
+  focusEditor: () => void;
+  runToolbarAction: (actionId: ToolbarActionId) => void;
 }
 
 interface EditorPaneProps {
   document: StoredDocument;
   onContentChange: (content: JSONContent, html: string, plainText: string) => void;
-  onSelectionChange: (selectionText: string) => void;
+  onSelectionChange: (selection: EditorSelection) => void;
+  onToolbarStateChange?: (activeActions: ToolbarActionId[]) => void;
 }
 
 function escapeHtml(value: string) {
@@ -50,92 +49,22 @@ function textToHtml(text: string) {
     .join("");
 }
 
-interface ToolbarButton {
-  icon: LucideIcon;
-  label: string;
-  command: (editor: Editor) => void;
-  isActive: (editor: Editor) => boolean;
-}
-
-const toolbarButtons: ToolbarButton[] = [
-  {
-    icon: Heading1,
-    label: "H1",
-    command: (editor) => {
-      editor.chain().focus().toggleHeading({ level: 1 }).run();
-    },
-    isActive: (editor) => editor.isActive("heading", { level: 1 }),
-  },
-  {
-    icon: Heading2,
-    label: "H2",
-    command: (editor) => {
-      editor.chain().focus().toggleHeading({ level: 2 }).run();
-    },
-    isActive: (editor) => editor.isActive("heading", { level: 2 }),
-  },
-  {
-    icon: Bold,
-    label: "Fet",
-    command: (editor) => {
-      editor.chain().focus().toggleBold().run();
-    },
-    isActive: (editor) => editor.isActive("bold"),
-  },
-  {
-    icon: Italic,
-    label: "Kursiv",
-    command: (editor) => {
-      editor.chain().focus().toggleItalic().run();
-    },
-    isActive: (editor) => editor.isActive("italic"),
-  },
-  {
-    icon: UnderlineIcon,
-    label: "Understreket",
-    command: (editor) => {
-      editor.chain().focus().toggleUnderline().run();
-    },
-    isActive: (editor) => editor.isActive("underline"),
-  },
-  {
-    icon: List,
-    label: "Liste",
-    command: (editor) => {
-      editor.chain().focus().toggleBulletList().run();
-    },
-    isActive: (editor) => editor.isActive("bulletList"),
-  },
-  {
-    icon: Quote,
-    label: "Sitat",
-    command: (editor) => {
-      editor.chain().focus().toggleBlockquote().run();
-    },
-    isActive: (editor) => editor.isActive("blockquote"),
-  },
-  {
-    icon: Table2,
-    label: "Tabell",
-    command: (editor) => {
-      editor.chain().focus().insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run();
-    },
-    isActive: () => false,
-  },
-  {
-    icon: Pilcrow,
-    label: "Avsnitt",
-    command: (editor) => {
-      editor.chain().focus().setParagraph().run();
-    },
-    isActive: (editor) => editor.isActive("paragraph"),
-  },
-];
-
 export const EditorPane = forwardRef<EditorPaneHandle, EditorPaneProps>(function EditorPane(
-  { document, onContentChange, onSelectionChange },
+  { document, onContentChange, onSelectionChange, onToolbarStateChange },
   ref,
 ) {
+  const emitToolbarState = useEffectEvent((currentEditor: Editor | null | undefined) => {
+    if (!currentEditor || !onToolbarStateChange) {
+      return;
+    }
+
+    onToolbarStateChange(
+      toolbarActions
+        .filter((action) => action.isActive(currentEditor))
+        .map((action) => action.id),
+    );
+  });
+
   const editor = useEditor({
     extensions: [
       StarterKit.configure({
@@ -160,10 +89,19 @@ export const EditorPane = forwardRef<EditorPaneHandle, EditorPaneProps>(function
         currentEditor.getHTML(),
         currentEditor.getText({ blockSeparator: "\n\n" }),
       );
+      emitToolbarState(currentEditor);
     },
     onSelectionUpdate({ editor: currentEditor }) {
       const { from, to } = currentEditor.state.selection;
-      onSelectionChange(currentEditor.state.doc.textBetween(from, to, "\n"));
+      onSelectionChange({
+        text: currentEditor.state.doc.textBetween(from, to, "\n"),
+        from,
+        to,
+      });
+      emitToolbarState(currentEditor);
+    },
+    onCreate({ editor: currentEditor }) {
+      emitToolbarState(currentEditor);
     },
   });
 
@@ -173,24 +111,42 @@ export const EditorPane = forwardRef<EditorPaneHandle, EditorPaneProps>(function
     }
 
     editor.commands.setContent(document.content, { emitUpdate: false });
-    onSelectionChange("");
-  }, [document.id, editor, onSelectionChange]);
+    onSelectionChange({
+      text: "",
+      from: 1,
+      to: 1,
+    });
+    emitToolbarState(editor);
+  }, [document.id, editor, emitToolbarState, onSelectionChange]);
 
   useImperativeHandle(ref, () => ({
-    applyAction(action) {
+    applyAction(preview) {
       if (!editor) {
         return;
       }
 
+      const { action } = preview;
       const html = textToHtml(action.content);
+      const selectionFrom = Math.max(1, preview.selection_from);
+      const selectionTo = Math.max(selectionFrom, preview.selection_to);
 
       if (action.action_type === "replace_selection") {
-        editor.chain().focus().insertContent(html).run();
+        editor
+          .chain()
+          .focus()
+          .setTextSelection({ from: selectionFrom, to: selectionTo })
+          .insertContent(html)
+          .run();
         return;
       }
 
       if (action.action_type === "insert_after_cursor") {
-        editor.chain().focus().insertContent(html).run();
+        editor
+          .chain()
+          .focus()
+          .setTextSelection(selectionTo)
+          .insertContent(html)
+          .run();
         return;
       }
 
@@ -205,23 +161,22 @@ export const EditorPane = forwardRef<EditorPaneHandle, EditorPaneProps>(function
         .insertContent(`<h2>${escapeHtml(action.title)}</h2>${html}`)
         .run();
     },
-  }), [editor]);
+    focusEditor() {
+      editor?.commands.focus();
+    },
+    runToolbarAction(actionId) {
+      if (!editor) {
+        return;
+      }
+
+      const action = toolbarActions.find((entry) => entry.id === actionId);
+      action?.command(editor);
+      emitToolbarState(editor);
+    },
+  }), [editor, emitToolbarState]);
 
   return (
     <section className="editor-shell">
-      <div className="editor-toolbar">
-        {toolbarButtons.map(({ icon: Icon, label, command, isActive }) => (
-          <button
-            key={label}
-            className={`toolbar-button ${editor && isActive(editor) ? "active" : ""}`}
-            onClick={() => editor && command(editor)}
-            type="button"
-          >
-            <Icon size={16} />
-            {label}
-          </button>
-        ))}
-      </div>
       <div className="editor-surface">
         <EditorContent editor={editor} />
       </div>

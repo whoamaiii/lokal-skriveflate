@@ -6,12 +6,40 @@ mod storage;
 
 use anyhow::{Context, Result};
 use tauri::Manager;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+
+use std::{collections::HashMap, sync::Arc};
 
 use crate::{agent::AgentService, storage::StorageService};
 
 pub struct AppState {
     pub storage: StorageService,
     pub agent: AgentService,
+    pub turn_coordinator: TurnCoordinator,
+}
+
+pub struct TurnCoordinator {
+    gates: AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+}
+
+impl TurnCoordinator {
+    fn new() -> Self {
+        Self {
+            gates: AsyncMutex::new(HashMap::new()),
+        }
+    }
+
+    pub async fn lock(&self, document_id: &str) -> OwnedMutexGuard<()> {
+        let gate = {
+            let mut gates = self.gates.lock().await;
+            gates
+                .entry(document_id.to_string())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+
+        gate.lock_owned().await
+    }
 }
 
 fn build_state(app: &tauri::AppHandle) -> Result<AppState> {
@@ -27,6 +55,7 @@ fn build_state(app: &tauri::AppHandle) -> Result<AppState> {
     Ok(AppState {
         storage: StorageService::new(app_data_dir.clone())?,
         agent: AgentService::new(app_data_dir, resource_root, app_version),
+        turn_coordinator: TurnCoordinator::new(),
     })
 }
 

@@ -19,9 +19,9 @@ interface IndicatorFrame {
 }
 
 const navItems = [
-  { icon: House, id: "home" as const, label: "Home" },
-  { icon: Search, id: "search" as const, label: "Search" },
-  { icon: UserRound, id: "user" as const, label: "User" },
+  { icon: House, id: "home" as const, label: "Hjem" },
+  { icon: Search, id: "search" as const, label: "Dokument" },
+  { icon: UserRound, id: "user" as const, label: "Assistent" },
 ];
 
 export function FloatingNav({
@@ -109,7 +109,7 @@ export function FloatingNav({
           <div className="floating-nav-indicator-plate" />
         </div>
 
-        <nav className="floating-nav-buttons" aria-label="Workspace navigation">
+        <nav className="floating-nav-buttons" aria-label="Navigasjon i arbeidsflaten">
           {navItems.map(({ icon: Icon, id, label }, index) => (
             <div className="floating-nav-item" key={id}>
               <button
@@ -130,7 +130,7 @@ export function FloatingNav({
         </nav>
 
         <button
-          aria-label={themeMode === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+          aria-label={themeMode === "dark" ? "Bytt til lyst tema" : "Bytt til mørkt tema"}
           className={`floating-nav-button floating-nav-theme-toggle ${
             isThemeAnimating ? "is-bouncing" : ""
           }`}

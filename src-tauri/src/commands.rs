@@ -10,8 +10,14 @@ use crate::{
     AppState,
 };
 
+const DOCUMENT_CONFLICT_PREFIX: &str = "document_conflict:";
+
 fn stringify_error(error: anyhow::Error) -> String {
     error.to_string()
+}
+
+fn document_conflict(message: &str) -> String {
+    format!("{DOCUMENT_CONFLICT_PREFIX} {message}")
 }
 
 #[tauri::command]
@@ -25,6 +31,7 @@ pub async fn bootstrap(state: State<'_, AppState>) -> Result<AppBootstrap, Strin
         runtime_status,
         settings: bootstrap.settings,
         workflow_modules: default_workflows(),
+        recovery_notices: bootstrap.workspace.recovery_notices,
     })
 }
 
@@ -33,7 +40,10 @@ pub async fn create_document(
     title: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<WorkspaceSnapshot, String> {
-    state.storage.create_document(title).map_err(stringify_error)
+    state
+        .storage
+        .create_document(title)
+        .map_err(stringify_error)
 }
 
 #[tauri::command]
@@ -41,7 +51,10 @@ pub async fn open_document(
     document_id: String,
     state: State<'_, AppState>,
 ) -> Result<WorkspaceSnapshot, String> {
-    state.storage.open_document(&document_id).map_err(stringify_error)
+    state
+        .storage
+        .open_document(&document_id)
+        .map_err(stringify_error)
 }
 
 #[tauri::command]
@@ -49,7 +62,10 @@ pub async fn save_document(
     request: SaveDocumentRequest,
     state: State<'_, AppState>,
 ) -> Result<crate::models::StoredDocument, String> {
-    state.storage.save_document(request).map_err(stringify_error)
+    state
+        .storage
+        .save_document(request)
+        .map_err(stringify_error)
 }
 
 #[tauri::command]
@@ -63,11 +79,18 @@ pub async fn send_assistant_turn(
     request: AssistantTurnRequest,
     state: State<'_, AppState>,
 ) -> Result<AssistantTurnResult, String> {
+    let _turn_guard = state.turn_coordinator.lock(&request.document_id).await;
     let settings = state.storage.settings().map_err(stringify_error)?;
     let document = state
         .storage
         .document(&request.document_id)
         .map_err(stringify_error)?;
+
+    if document.content_revision != request.document_revision {
+        return Err(document_conflict(
+            "Dokumentet ble endret før AI-forespørselen kunne starte. Oppdater dokumentet og prøv igjen.",
+        ));
+    }
 
     let (assistant_reply, editor_action, thread_id) = state
         .agent
@@ -80,6 +103,16 @@ pub async fn send_assistant_turn(
         .clone()
         .map(|action| format!("{action}: {}", request.prompt))
         .unwrap_or_else(|| request.prompt.clone());
+
+    let current_document = state
+        .storage
+        .document(&request.document_id)
+        .map_err(stringify_error)?;
+    if current_document.content_revision != request.document_revision {
+        return Err(document_conflict(
+            "Dokumentet ble endret mens AI jobbet. Dokumentet er oppdatert, og du kan sende forespørselen på nytt.",
+        ));
+    }
 
     let updated_document = state
         .storage
@@ -151,11 +184,20 @@ pub async fn activate_model(
         .storage
         .save_settings(AppSettings {
             selected_model: model_id,
-            preferred_tone: state.storage.settings().map_err(stringify_error)?.preferred_tone,
+            preferred_tone: state
+                .storage
+                .settings()
+                .map_err(stringify_error)?
+                .preferred_tone,
         })
         .map_err(stringify_error)?;
 
-    runtime_action_payload(state, format!("Byttet til {}", settings.selected_model), settings).await
+    runtime_action_payload(
+        state,
+        format!("Byttet til {}", settings.selected_model),
+        settings,
+    )
+    .await
 }
 
 #[tauri::command]

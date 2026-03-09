@@ -3,9 +3,10 @@ import type { RuntimeStatus } from "../types";
 
 interface StatusStripProps {
   runtimeStatus: RuntimeStatus;
+  compact?: boolean;
 }
 
-export function StatusStrip({ runtimeStatus }: StatusStripProps) {
+export function StatusStrip({ runtimeStatus, compact = false }: StatusStripProps) {
   const runtimeLabel =
     runtimeStatus.runtime_state === "ready"
       ? "Klar"
@@ -16,7 +17,7 @@ export function StatusStrip({ runtimeStatus }: StatusStripProps) {
           : "Ikke klar";
 
   return (
-    <footer className="status-strip">
+    <footer className={`status-strip ${compact ? "status-strip-compact" : ""}`}>
       <div className="status-pill">
         <ShieldCheck size={14} />
         {runtimeStatus.local_only ? "Kun lokal kjøring" : "Blandet modus"}

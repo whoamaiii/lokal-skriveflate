@@ -22,7 +22,11 @@ pub struct AgentService {
 }
 
 impl AgentService {
-    pub fn new(app_data_root: std::path::PathBuf, resource_root: std::path::PathBuf, app_version: String) -> Self {
+    pub fn new(
+        app_data_root: std::path::PathBuf,
+        resource_root: std::path::PathBuf,
+        app_version: String,
+    ) -> Self {
         Self {
             provider: EmbeddedLlamaCppProvider::new(app_data_root, resource_root, app_version),
         }
@@ -68,8 +72,9 @@ impl AgentService {
         )
         .await?;
 
-        let parsed = parse_structured_response(&raw_response)
-            .with_context(|| format!("Kunne ikke tolke Codex-svaret som strukturert JSON: {raw_response}"))?;
+        let parsed = parse_structured_response(&raw_response).with_context(|| {
+            format!("Kunne ikke tolke Codex-svaret som strukturert JSON: {raw_response}")
+        })?;
 
         Ok((parsed.assistant_reply, parsed.editor_action, thread_id))
     }

@@ -1,10 +1,14 @@
 use std::{
-    env, fs,
+    collections::HashMap,
+    env,
+    fs::{self, File},
+    io::{BufReader, Read},
     net::TcpListener,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
-    time::Duration,
+    sync::Mutex as StdMutex,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{bail, Context, Result};
@@ -45,12 +49,21 @@ pub struct EmbeddedLlamaCppProvider {
     resource_root: PathBuf,
     app_version: String,
     managed_runtime: Mutex<Option<ManagedRuntime>>,
+    lifecycle_gate: Mutex<()>,
+    sha_cache: StdMutex<HashMap<PathBuf, ShaCacheEntry>>,
 }
 
 struct ManagedRuntime {
     child: Child,
     port: u16,
     model_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct ShaCacheEntry {
+    len: u64,
+    modified: Option<SystemTime>,
+    digest: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +115,8 @@ impl EmbeddedLlamaCppProvider {
             resource_root,
             app_version,
             managed_runtime: Mutex::new(None),
+            lifecycle_gate: Mutex::new(()),
+            sha_cache: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -188,6 +203,55 @@ impl EmbeddedLlamaCppProvider {
         })
     }
 
+    fn clear_sha_cache(&self) {
+        if let Ok(mut cache) = self.sha_cache.lock() {
+            cache.clear();
+        }
+    }
+
+    fn sha256_file(&self, path: &Path) -> Result<String> {
+        let metadata = fs::metadata(path)
+            .with_context(|| format!("Kunne ikke lese metadata for {}", path.display()))?;
+        let len = metadata.len();
+        let modified = metadata.modified().ok();
+
+        if let Ok(cache) = self.sha_cache.lock() {
+            if let Some(entry) = cache.get(path) {
+                if entry.len == len && entry.modified == modified {
+                    return Ok(entry.digest.clone());
+                }
+            }
+        }
+
+        let file = File::open(path)
+            .with_context(|| format!("Kunne ikke lese {} for sjekksum", path.display()))?;
+        let mut reader = BufReader::new(file);
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+
+        let digest = format!("{:x}", hasher.finalize());
+        if let Ok(mut cache) = self.sha_cache.lock() {
+            cache.insert(
+                path.to_path_buf(),
+                ShaCacheEntry {
+                    len,
+                    modified,
+                    digest: digest.clone(),
+                },
+            );
+        }
+
+        Ok(digest)
+    }
+
     fn inspect_asset(
         &self,
         target_path: PathBuf,
@@ -203,7 +267,7 @@ impl EmbeddedLlamaCppProvider {
             };
         }
 
-        match sha256_file(&target_path) {
+        match self.sha256_file(&target_path) {
             Ok(actual_sha) if actual_sha == expected_sha => {
                 let details = if placeholder {
                     Some(format!(
@@ -284,7 +348,7 @@ impl EmbeddedLlamaCppProvider {
 
         if !force && target.exists() {
             if let Some(expected_sha) = expected_sha {
-                if let Ok(actual_sha) = sha256_file(target) {
+                if let Ok(actual_sha) = self.sha256_file(target) {
                     if actual_sha == expected_sha {
                         return Ok(false);
                     }
@@ -313,7 +377,7 @@ impl EmbeddedLlamaCppProvider {
         }
 
         if let Some(expected_sha) = expected_sha {
-            let actual_sha = sha256_file(target)?;
+            let actual_sha = self.sha256_file(target)?;
             if actual_sha != expected_sha {
                 bail!(
                     "Sjekksum stemmer ikke for {} etter kopiering",
@@ -325,7 +389,7 @@ impl EmbeddedLlamaCppProvider {
         Ok(true)
     }
 
-    fn prepare_runtime_files(&self, force: bool) -> Result<usize> {
+    fn prepare_runtime_files(&self, selected_model: &str, force: bool) -> Result<usize> {
         let manifest = self.load_manifest()?;
         let runtime_home = self.runtime_home();
         fs::create_dir_all(runtime_home.join("bin"))?;
@@ -348,6 +412,16 @@ impl EmbeddedLlamaCppProvider {
 
         for model in &manifest.models {
             let source = self.resolve_model_source(model);
+            if !source.exists() {
+                if model.bundled {
+                    bail!("Fant ikke ressursfila {}", source.display());
+                }
+                if model.id == selected_model {
+                    continue;
+                }
+                continue;
+            }
+
             copied += usize::from(self.copy_asset(
                 &source,
                 &self.model_target_path(model),
@@ -361,6 +435,7 @@ impl EmbeddedLlamaCppProvider {
             )?);
         }
 
+        self.clear_sha_cache();
         Ok(copied)
     }
 
@@ -383,12 +458,14 @@ impl EmbeddedLlamaCppProvider {
         }
     }
 
-    async fn stop_runtime(&self) {
+    async fn stop_runtime_locked(&self) -> Result<()> {
         let mut guard = self.managed_runtime.lock().await;
-        if let Some(runtime) = guard.as_mut() {
-            let _ = runtime.child.start_kill();
-        }
-        *guard = None;
+        let Some(mut runtime) = guard.take() else {
+            return Ok(());
+        };
+        drop(guard);
+
+        cleanup_child(&mut runtime.child).await
     }
 
     async fn healthcheck_port(&self, port: u16) -> bool {
@@ -421,8 +498,8 @@ impl EmbeddedLlamaCppProvider {
     }
 
     fn select_free_port(&self) -> Result<u16> {
-        let socket = TcpListener::bind("127.0.0.1:0")
-            .context("Kunne ikke finne en ledig localhost-port")?;
+        let socket =
+            TcpListener::bind("127.0.0.1:0").context("Kunne ikke finne en ledig localhost-port")?;
         let port = socket
             .local_addr()
             .context("Kunne ikke lese localhost-port")?
@@ -443,7 +520,7 @@ impl EmbeddedLlamaCppProvider {
             return Ok(inspection);
         }
 
-        self.prepare_runtime_files(false)?;
+        self.prepare_runtime_files(&settings.selected_model, false)?;
         let refreshed = self.inspect_runtime()?;
         let refreshed_selected = refreshed
             .models
@@ -488,8 +565,7 @@ impl EmbeddedLlamaCppProvider {
             .find(|(model, _)| model.id == selected_model)
             .map(|(_, inspection)| inspection);
 
-        if inspection.engine.needs_repair
-            || selected.is_some_and(|selected| selected.needs_repair)
+        if inspection.engine.needs_repair || selected.is_some_and(|selected| selected.needs_repair)
         {
             RuntimePhase::RepairRequired
         } else if inspection.engine.installed && selected.is_some_and(|selected| selected.installed)
@@ -557,6 +633,63 @@ impl EmbeddedLlamaCppProvider {
                 details: model_inspection.details.clone(),
             })
             .collect()
+    }
+
+    async fn start_runtime_locked(&self, settings: &AppSettings) -> Result<String> {
+        if let Some((port, model_id)) = self.current_runtime_snapshot().await {
+            if model_id == settings.selected_model && self.healthcheck_port(port).await {
+                return Ok(format!(
+                    "Lokal runtime kjører allerede på http://127.0.0.1:{port}/v1"
+                ));
+            }
+            self.stop_runtime_locked().await?;
+        }
+
+        let inspection = self.ensure_runtime_assets(settings).await?;
+        let manifest = self.load_manifest()?;
+        let selected_model = Self::catalog_model(&manifest, &settings.selected_model)?;
+        let binary_path = inspection.engine_path.clone();
+        let model_path = self.model_target_path(selected_model);
+        let port = self.select_free_port()?;
+
+        let mut child = Command::new(&binary_path)
+            .arg("-m")
+            .arg(&model_path)
+            .arg("-a")
+            .arg(&settings.selected_model)
+            .arg("--host")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--ctx-size")
+            .arg("4096")
+            .arg("--api-key")
+            .arg(LOCAL_API_KEY)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "Kunne ikke starte lokal runtime via {}",
+                    binary_path.display()
+                )
+            })?;
+
+        if let Err(error) = self.wait_for_health(port).await {
+            let _ = cleanup_child(&mut child).await;
+            return Err(error);
+        }
+
+        let mut guard = self.managed_runtime.lock().await;
+        *guard = Some(ManagedRuntime {
+            child,
+            port,
+            model_id: settings.selected_model.clone(),
+        });
+
+        Ok(format!(
+            "Startet lokal llama.cpp-runtime på http://127.0.0.1:{port}/v1"
+        ))
     }
 }
 
@@ -629,7 +762,8 @@ impl LocalModelProvider for EmbeddedLlamaCppProvider {
     }
 
     async fn prepare_runtime(&self, settings: &AppSettings) -> Result<String> {
-        let copied = self.prepare_runtime_files(false)?;
+        let _lifecycle = self.lifecycle_gate.lock().await;
+        let copied = self.prepare_runtime_files(&settings.selected_model, false)?;
         let inspection = self.inspect_runtime()?;
         let selected_model = inspection
             .models
@@ -637,15 +771,17 @@ impl LocalModelProvider for EmbeddedLlamaCppProvider {
             .find(|(model, _)| model.id == settings.selected_model)
             .map(|(_, status)| status);
 
-        let message = if inspection.engine.installed && selected_model.is_some_and(|model| model.installed) {
-            let started = self.start_runtime(settings).await?;
+        let message = if inspection.engine.installed
+            && selected_model.is_some_and(|model| model.installed)
+        {
+            let started = self.start_runtime_locked(settings).await?;
             format!(
-                "Lokal AI er klargjort i {}. Kopierte {copied} filer.",
+                "Lokal AI er klargjort i {}. Kopierte {copied} filer. {started}",
                 inspection.runtime_home.display()
-            ) + &format!(" {started}")
+            )
         } else {
             format!(
-                "Runtime-mappen er klargjort i {}, men denne utviklerbyggen bruker placeholder-artefakter. Legg inn ekte llama.cpp- og Qwen3-filer eller sett miljøvariablene `LOKAL_AI_BINARY_PATH` og `LOKAL_AI_STANDARD_MODEL_PATH`.",
+                "Runtime-mappen er klargjort i {}, men den valgte modellpakken er ikke installert ennå. Legg inn ekte llama.cpp- og modellfiler eller bruk miljøvariablene for lokal test.",
                 inspection.runtime_home.display()
             )
         };
@@ -654,65 +790,16 @@ impl LocalModelProvider for EmbeddedLlamaCppProvider {
     }
 
     async fn start_runtime(&self, settings: &AppSettings) -> Result<String> {
-        if let Some((port, model_id)) = self.current_runtime_snapshot().await {
-            if model_id == settings.selected_model && self.healthcheck_port(port).await {
-                return Ok(format!(
-                    "Lokal runtime kjører allerede på http://127.0.0.1:{port}/v1"
-                ));
-            }
-            self.stop_runtime().await;
-        }
-
-        let inspection = self.ensure_runtime_assets(settings).await?;
-        let manifest = self.load_manifest()?;
-        let selected_model = Self::catalog_model(&manifest, &settings.selected_model)?;
-        let binary_path = inspection.engine_path.clone();
-        let model_path = self.model_target_path(selected_model);
-        let port = self.select_free_port()?;
-
-        let mut child = Command::new(&binary_path)
-            .arg("-m")
-            .arg(&model_path)
-            .arg("-a")
-            .arg(&settings.selected_model)
-            .arg("--host")
-            .arg("127.0.0.1")
-            .arg("--port")
-            .arg(port.to_string())
-            .arg("--ctx-size")
-            .arg("4096")
-            .arg("--api-key")
-            .arg(LOCAL_API_KEY)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "Kunne ikke starte lokal runtime via {}",
-                    binary_path.display()
-                )
-            })?;
-
-        if let Err(error) = self.wait_for_health(port).await {
-            let _ = child.start_kill();
-            return Err(error);
-        }
-
-        let mut guard = self.managed_runtime.lock().await;
-        *guard = Some(ManagedRuntime {
-            child,
-            port,
-            model_id: settings.selected_model.clone(),
-        });
-
-        Ok(format!(
-            "Startet lokal llama.cpp-runtime på http://127.0.0.1:{port}/v1"
-        ))
+        let _lifecycle = self.lifecycle_gate.lock().await;
+        self.start_runtime_locked(settings).await
     }
 
     async fn healthcheck(&self, settings: &AppSettings) -> Result<String> {
         let Some((port, model_id)) = self.current_runtime_snapshot().await else {
-            bail!("Lokal runtime kjører ikke akkurat nå for {}", settings.selected_model);
+            bail!(
+                "Lokal runtime kjører ikke akkurat nå for {}",
+                settings.selected_model
+            );
         };
 
         if model_id != settings.selected_model {
@@ -735,8 +822,10 @@ impl LocalModelProvider for EmbeddedLlamaCppProvider {
 
     async fn activate_model(&self, model: &str) -> Result<String> {
         let inspection = self.inspect_runtime()?;
-        let Some((catalog, model_inspection)) =
-            inspection.models.iter().find(|(catalog, _)| catalog.id == model)
+        let Some((catalog, model_inspection)) = inspection
+            .models
+            .iter()
+            .find(|(catalog, _)| catalog.id == model)
         else {
             bail!("Fant ikke modellvalget `{model}`");
         };
@@ -755,8 +844,9 @@ impl LocalModelProvider for EmbeddedLlamaCppProvider {
     }
 
     async fn repair_runtime(&self, settings: &AppSettings) -> Result<String> {
-        self.stop_runtime().await;
-        let copied = self.prepare_runtime_files(true)?;
+        let _lifecycle = self.lifecycle_gate.lock().await;
+        self.stop_runtime_locked().await?;
+        let copied = self.prepare_runtime_files(&settings.selected_model, true)?;
         let inspection = self.inspect_runtime()?;
         let selected_model = inspection
             .models
@@ -770,7 +860,7 @@ impl LocalModelProvider for EmbeddedLlamaCppProvider {
         );
 
         if inspection.engine.installed && selected_model.is_some_and(|model| model.installed) {
-            let started = self.start_runtime(settings).await?;
+            let started = self.start_runtime_locked(settings).await?;
             message.push(' ');
             message.push_str(&started);
         }
@@ -779,7 +869,8 @@ impl LocalModelProvider for EmbeddedLlamaCppProvider {
     }
 
     async fn runtime_endpoint(&self, settings: &AppSettings) -> Result<String> {
-        self.start_runtime(settings).await?;
+        let _lifecycle = self.lifecycle_gate.lock().await;
+        self.start_runtime_locked(settings).await?;
         let Some((port, _)) = self.current_runtime_snapshot().await else {
             bail!("Lokal runtime startet ikke riktig")
         };
@@ -787,9 +878,140 @@ impl LocalModelProvider for EmbeddedLlamaCppProvider {
     }
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
-    let bytes = fs::read(path)
-        .with_context(|| format!("Kunne ikke lese {} for sjekksum", path.display()))?;
-    let digest = Sha256::digest(bytes);
-    Ok(format!("{digest:x}"))
+async fn cleanup_child(child: &mut Child) -> Result<()> {
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
+
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "lokal-skriveflate-local-model-test-{label}-{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn write_file(path: &Path, contents: &[u8]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, contents).unwrap();
+    }
+
+    fn sha(contents: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(contents))
+    }
+
+    #[test]
+    fn prepare_runtime_files_skips_missing_optional_model() {
+        let resource_root = temp_dir("resources");
+        let app_data_root = temp_dir("app");
+        let engine_bytes = b"engine";
+        let standard_bytes = b"standard";
+
+        write_file(
+            &resource_root.join("embedded-runtime/bin/llama-server"),
+            engine_bytes,
+        );
+        write_file(
+            &resource_root.join("embedded-runtime/models/qwen3-4b-instruct-q4_k_m.gguf"),
+            standard_bytes,
+        );
+
+        let manifest = serde_json::json!({
+            "engine": {
+                "resource": "embedded-runtime/bin/llama-server",
+                "target_name": "llama-server",
+                "sha256": sha(engine_bytes),
+                "placeholder": false
+            },
+            "models": [
+                {
+                    "id": DEFAULT_MODEL,
+                    "label": "Standard",
+                    "tier": "Standard",
+                    "resource": "embedded-runtime/models/qwen3-4b-instruct-q4_k_m.gguf",
+                    "filename": "qwen3-4b-instruct-q4_k_m.gguf",
+                    "sha256": sha(standard_bytes),
+                    "bundled": true,
+                    "placeholder": false
+                },
+                {
+                    "id": QUALITY_MODEL,
+                    "label": "Quality",
+                    "tier": "Bedre kvalitet",
+                    "resource": "embedded-runtime/models/qwen3-8b-instruct-q4_k_m.gguf",
+                    "filename": "qwen3-8b-instruct-q4_k_m.gguf",
+                    "sha256": sha(b"optional"),
+                    "bundled": false,
+                    "placeholder": false
+                }
+            ]
+        });
+        write_file(
+            &resource_root.join("embedded-runtime/manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap().as_slice(),
+        );
+
+        let provider = EmbeddedLlamaCppProvider::new(
+            app_data_root.clone(),
+            resource_root,
+            "0.1.0".to_string(),
+        );
+
+        let copied = provider
+            .prepare_runtime_files(DEFAULT_MODEL, false)
+            .unwrap();
+        let inspection = provider.inspect_runtime().unwrap();
+
+        assert_eq!(copied, 2);
+        assert!(inspection.engine.installed);
+        assert!(
+            inspection
+                .models
+                .iter()
+                .find(|(model, _)| model.id == DEFAULT_MODEL)
+                .unwrap()
+                .1
+                .installed
+        );
+        assert!(
+            !inspection
+                .models
+                .iter()
+                .find(|(model, _)| model.id == QUALITY_MODEL)
+                .unwrap()
+                .1
+                .installed
+        );
+    }
+
+    #[test]
+    fn sha_cache_refreshes_when_file_changes() {
+        let resource_root = temp_dir("sha-resources");
+        let app_data_root = temp_dir("sha-app");
+        let provider =
+            EmbeddedLlamaCppProvider::new(app_data_root, resource_root, "0.1.0".to_string());
+        let file_path = temp_dir("sha-file").join("asset.bin");
+
+        write_file(&file_path, b"first");
+        let first = provider.sha256_file(&file_path).unwrap();
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_file(&file_path, b"second");
+        let second = provider.sha256_file(&file_path).unwrap();
+
+        assert_ne!(first, second);
+    }
 }

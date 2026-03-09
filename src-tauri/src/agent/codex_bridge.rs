@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::Command,
+    process::{Child, Command},
     time::{timeout, Duration},
 };
 
@@ -70,112 +70,117 @@ impl CodexBridge {
             .spawn()
             .context("Kunne ikke starte `codex app-server`")?;
 
-        let mut stdin = child.stdin.take().context("Manglende stdin til Codex")?;
-        let stdout = child.stdout.take().context("Manglende stdout fra Codex")?;
-        let mut reader = BufReader::new(stdout);
+        let turn_result = async {
+            let mut stdin = child.stdin.take().context("Manglende stdin til Codex")?;
+            let stdout = child.stdout.take().context("Manglende stdout fra Codex")?;
+            let mut reader = BufReader::new(stdout);
 
-        send_message(
-            &mut stdin,
-            &json!({
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "clientInfo": {
-                        "name": "lokal_skriveflate",
-                        "title": "Lokal Skriveflate",
-                        "version": "0.1.0"
-                    },
-                    "capabilities": null
-                }
-            }),
-        )
-        .await?;
-
-        wait_for_response(&mut reader, 1).await?;
-
-        send_message(&mut stdin, &json!({ "method": "initialized" })).await?;
-
-        let developer_instructions = "You are an offline-first Norwegian writing assistant inside a local desktop app. Never call tools. Never suggest shell commands. Keep all user data local. Always return only valid JSON that matches the provided schema. If an edit is appropriate, include exactly one editor_action. If no edit is needed, set editor_action to null.";
-
-        let thread_id = if let Some(thread_id) = existing_thread_id {
             send_message(
                 &mut stdin,
                 &json!({
-                    "id": 2,
-                    "method": "thread/resume",
+                    "id": 1,
+                    "method": "initialize",
                     "params": {
-                        "threadId": thread_id,
-                        "model": model,
-                        "modelProvider": "lokal_llamacpp",
-                        "sandbox": "read-only",
-                        "approvalPolicy": "never",
-                        "developerInstructions": developer_instructions,
-                        "persistExtendedHistory": true
+                        "clientInfo": {
+                            "name": "lokal_skriveflate",
+                            "title": "Lokal Skriveflate",
+                            "version": "0.1.0"
+                        },
+                        "capabilities": null
                     }
                 }),
             )
             .await?;
 
-            let response = wait_for_response(&mut reader, 2).await?;
-            response["thread"]["id"]
-                .as_str()
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| thread_id.to_string())
-        } else {
+            wait_for_response(&mut reader, 1).await?;
+
+            send_message(&mut stdin, &json!({ "method": "initialized" })).await?;
+
+            let developer_instructions = "You are an offline-first Norwegian writing assistant inside a local desktop app. Never call tools. Never suggest shell commands. Keep all user data local. Always return only valid JSON that matches the provided schema. If an edit is appropriate, include exactly one editor_action. If no edit is needed, set editor_action to null.";
+
+            let thread_id = if let Some(thread_id) = existing_thread_id {
+                send_message(
+                    &mut stdin,
+                    &json!({
+                        "id": 2,
+                        "method": "thread/resume",
+                        "params": {
+                            "threadId": thread_id,
+                            "model": model,
+                            "modelProvider": "lokal_llamacpp",
+                            "sandbox": "read-only",
+                            "approvalPolicy": "never",
+                            "developerInstructions": developer_instructions,
+                            "persistExtendedHistory": true
+                        }
+                    }),
+                )
+                .await?;
+
+                let response = wait_for_response(&mut reader, 2).await?;
+                response["thread"]["id"]
+                    .as_str()
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| thread_id.to_string())
+            } else {
+                send_message(
+                    &mut stdin,
+                    &json!({
+                        "id": 2,
+                        "method": "thread/start",
+                        "params": {
+                            "model": model,
+                            "modelProvider": "lokal_llamacpp",
+                            "cwd": codex_home.display().to_string(),
+                            "approvalPolicy": "never",
+                            "sandbox": "read-only",
+                            "developerInstructions": developer_instructions,
+                            "personality": "friendly",
+                            "experimentalRawEvents": false,
+                            "persistExtendedHistory": true
+                        }
+                    }),
+                )
+                .await?;
+
+                let response = wait_for_response(&mut reader, 2).await?;
+                response["thread"]["id"]
+                    .as_str()
+                    .map(ToOwned::to_owned)
+                    .context("thread/start returnerte ikke en thread-id")?
+            };
+
             send_message(
                 &mut stdin,
                 &json!({
-                    "id": 2,
-                    "method": "thread/start",
+                    "id": 3,
+                    "method": "turn/start",
                     "params": {
+                        "threadId": thread_id.clone(),
+                        "input": [{
+                            "type": "text",
+                            "text": prompt,
+                            "text_elements": []
+                        }],
                         "model": model,
-                        "modelProvider": "lokal_llamacpp",
-                        "cwd": codex_home.display().to_string(),
                         "approvalPolicy": "never",
-                        "sandbox": "read-only",
-                        "developerInstructions": developer_instructions,
-                        "personality": "friendly",
-                        "experimentalRawEvents": false,
-                        "persistExtendedHistory": true
+                        "outputSchema": output_schema
                     }
                 }),
             )
             .await?;
 
-            let response = wait_for_response(&mut reader, 2).await?;
-            response["thread"]["id"]
-                .as_str()
-                .map(ToOwned::to_owned)
-                .context("thread/start returnerte ikke en thread-id")?
-        };
+            let raw_response = wait_for_turn_completion(&mut reader).await?;
 
-        send_message(
-            &mut stdin,
-            &json!({
-                "id": 3,
-                "method": "turn/start",
-                "params": {
-                    "threadId": thread_id.clone(),
-                    "input": [{
-                        "type": "text",
-                        "text": prompt,
-                        "text_elements": []
-                    }],
-                    "model": model,
-                    "approvalPolicy": "never",
-                    "outputSchema": output_schema
-                }
-            }),
-        )
-        .await?;
+            Ok(CodexTurnOutput {
+                thread_id,
+                raw_response,
+            })
+        }
+        .await;
 
-        let raw_response = wait_for_turn_completion(&mut reader).await?;
-        let _ = child.kill().await;
-
-        Ok(CodexTurnOutput {
-            thread_id,
-            raw_response,
-        })
+        let _ = cleanup_child(&mut child).await;
+        turn_result
     }
 }
 
@@ -187,7 +192,10 @@ async fn send_message(stdin: &mut tokio::process::ChildStdin, payload: &Value) -
     Ok(())
 }
 
-async fn wait_for_response(reader: &mut BufReader<tokio::process::ChildStdout>, id: i32) -> Result<Value> {
+async fn wait_for_response(
+    reader: &mut BufReader<tokio::process::ChildStdout>,
+    id: i32,
+) -> Result<Value> {
     timeout(Duration::from_secs(30), async {
         loop {
             let mut line = String::new();
@@ -260,4 +268,14 @@ async fn wait_for_turn_completion(
     })
     .await
     .context("Timeout mens Codex genererte svar")?
+}
+
+async fn cleanup_child(child: &mut Child) -> Result<()> {
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
+
+    let _ = child.start_kill();
+    let _ = timeout(Duration::from_secs(5), child.wait()).await;
+    Ok(())
 }

@@ -1,11 +1,13 @@
 use std::{
-    fs,
+    fs::{self, File},
+    io::Write,
     path::{Path, PathBuf},
     sync::Mutex,
 };
 
 use anyhow::{Context, Result};
 use chrono::Utc;
+use serde::Serialize;
 use serde_json::json;
 use uuid::Uuid;
 
@@ -27,6 +29,16 @@ pub struct StorageService {
     gate: Mutex<()>,
 }
 
+struct DocumentsReadResult {
+    documents: Vec<PersistedDocument>,
+    recovery_notices: Vec<String>,
+}
+
+struct StateReadResult {
+    state: AppStateFile,
+    recovery_notices: Vec<String>,
+}
+
 impl StorageService {
     pub fn new(root: PathBuf) -> Result<Self> {
         let service = Self {
@@ -43,10 +55,19 @@ impl StorageService {
 
     pub fn bootstrap(&self) -> Result<StorageBootstrap> {
         let _guard = self.gate.lock().unwrap();
-        self.ensure_seed_data_locked()?;
+        let mut recovery_notices = self.ensure_seed_data_locked()?;
 
-        let mut state = self.read_state_locked()?;
-        let mut documents = self.read_documents_locked()?;
+        let StateReadResult {
+            mut state,
+            recovery_notices: state_notices,
+        } = self.read_state_locked()?;
+        extend_notices(&mut recovery_notices, state_notices);
+
+        let DocumentsReadResult {
+            mut documents,
+            recovery_notices: document_notices,
+        } = self.read_documents_locked()?;
+        extend_notices(&mut recovery_notices, document_notices);
         documents.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
 
         let active_id = state
@@ -68,6 +89,7 @@ impl StorageService {
             workspace: WorkspaceSnapshot {
                 documents: documents.iter().map(DocumentSummary::from).collect(),
                 active_document: StoredDocument::from(active_document),
+                recovery_notices,
             },
             settings: state.settings,
         })
@@ -75,7 +97,7 @@ impl StorageService {
 
     pub fn create_document(&self, title: Option<String>) -> Result<WorkspaceSnapshot> {
         let _guard = self.gate.lock().unwrap();
-        self.ensure_seed_data_locked()?;
+        let mut recovery_notices = self.ensure_seed_data_locked()?;
 
         let timestamp = now_iso();
         let document = PersistedDocument {
@@ -95,10 +117,12 @@ impl StorageService {
                     }
                 ]
             }),
-            html: "<p>Start her. Bruk chatpanelet for å få forslag som preview før de settes inn.</p>"
-                .to_string(),
-            plain_text: "Start her. Bruk chatpanelet for å få forslag som preview før de settes inn."
-                .to_string(),
+            html:
+                "<p>Start her. Bruk chatpanelet for å få forslag som preview før de settes inn.</p>"
+                    .to_string(),
+            plain_text:
+                "Start her. Bruk chatpanelet for å få forslag som preview før de settes inn."
+                    .to_string(),
             created_at: timestamp.clone(),
             updated_at: timestamp,
             thread_id: None,
@@ -111,31 +135,53 @@ impl StorageService {
                 "rapport".to_string(),
                 "prosjekt".to_string(),
             ],
+            content_revision: 0,
         };
 
         self.write_document_locked(&document)?;
 
-        let mut state = self.read_state_locked()?;
+        let StateReadResult {
+            mut state,
+            recovery_notices: state_notices,
+        } = self.read_state_locked()?;
+        extend_notices(&mut recovery_notices, state_notices);
         state.active_document_id = Some(document.id.clone());
         self.write_state_locked(&state)?;
 
-        self.workspace_for_document_locked(&document.id)
+        let mut workspace = self.workspace_for_document_locked(&document.id)?;
+        extend_notices(&mut workspace.recovery_notices, recovery_notices);
+        Ok(workspace)
     }
 
     pub fn open_document(&self, document_id: &str) -> Result<WorkspaceSnapshot> {
         let _guard = self.gate.lock().unwrap();
-        self.ensure_seed_data_locked()?;
+        let mut recovery_notices = self.ensure_seed_data_locked()?;
+        let mut workspace = self.workspace_for_document_locked(document_id)?;
 
-        let mut state = self.read_state_locked()?;
+        let StateReadResult {
+            mut state,
+            recovery_notices: state_notices,
+        } = self.read_state_locked()?;
+        extend_notices(&mut recovery_notices, state_notices);
         state.active_document_id = Some(document_id.to_string());
         self.write_state_locked(&state)?;
 
-        self.workspace_for_document_locked(document_id)
+        extend_notices(&mut workspace.recovery_notices, recovery_notices);
+        Ok(workspace)
     }
 
     pub fn save_document(&self, request: SaveDocumentRequest) -> Result<StoredDocument> {
         let _guard = self.gate.lock().unwrap();
         let mut document = self.read_document_locked(&request.id)?;
+
+        let content_changed = document.title != request.title
+            || document.content != request.content
+            || document.html != request.html
+            || document.plain_text != request.plain_text;
+
+        if !content_changed {
+            return Ok(StoredDocument::from(&document));
+        }
 
         if document.plain_text != request.plain_text {
             document.snapshots.push(DocumentSnapshot {
@@ -155,6 +201,7 @@ impl StorageService {
         document.html = request.html;
         document.plain_text = request.plain_text;
         document.updated_at = now_iso();
+        document.content_revision = document.content_revision.saturating_add(1);
 
         self.write_document_locked(&document)?;
         Ok(StoredDocument::from(&document))
@@ -188,32 +235,37 @@ impl StorageService {
         let _guard = self.gate.lock().unwrap();
         let document = self.read_document_locked(document_id)?;
         let safe_title = slugify(&document.title);
+        let escaped_title = escape_html(&document.title);
+        let sanitized_body = ammonia::clean(&document.html);
         let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
 
         let (target_path, bytes) = match format {
             OutputFormat::Html => {
                 let html = format!(
                     "<!doctype html><html lang=\"no\"><head><meta charset=\"utf-8\" /><title>{}</title><style>body{{font-family:Georgia,serif;max-width:780px;margin:48px auto;padding:0 24px;line-height:1.7;color:#1f1c18}}h1,h2,h3{{line-height:1.2}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #c7c0b5;padding:8px}}</style></head><body><h1>{}</h1>{}</body></html>",
-                    document.title,
-                    document.title,
-                    document.html
+                    escaped_title,
+                    escaped_title,
+                    sanitized_body
                 );
                 (
-                    self.exports_dir().join(format!("{safe_title}-{timestamp}.html")),
+                    self.exports_dir()
+                        .join(format!("{safe_title}-{timestamp}.html")),
                     html.into_bytes(),
                 )
             }
             OutputFormat::Txt => (
-                self.exports_dir().join(format!("{safe_title}-{timestamp}.txt")),
+                self.exports_dir()
+                    .join(format!("{safe_title}-{timestamp}.txt")),
                 document.plain_text.into_bytes(),
             ),
             OutputFormat::Pdf => (
-                self.exports_dir().join(format!("{safe_title}-{timestamp}.pdf")),
+                self.exports_dir()
+                    .join(format!("{safe_title}-{timestamp}.pdf")),
                 render_text_pdf(&document.plain_text)?,
             ),
         };
 
-        fs::write(&target_path, bytes)
+        self.write_bytes_atomic(&target_path, &bytes)
             .with_context(|| format!("Kunne ikke skrive eksport til {}", target_path.display()))?;
 
         Ok(ExportResult {
@@ -224,7 +276,7 @@ impl StorageService {
 
     pub fn save_settings(&self, settings: AppSettings) -> Result<AppSettings> {
         let _guard = self.gate.lock().unwrap();
-        let mut state = self.read_state_locked()?;
+        let StateReadResult { mut state, .. } = self.read_state_locked()?;
         state.settings = settings.clone();
         self.write_state_locked(&state)?;
         Ok(settings)
@@ -232,7 +284,7 @@ impl StorageService {
 
     pub fn settings(&self) -> Result<AppSettings> {
         let _guard = self.gate.lock().unwrap();
-        Ok(self.read_state_locked()?.settings)
+        Ok(self.read_state_locked()?.state.settings)
     }
 
     pub fn document(&self, document_id: &str) -> Result<StoredDocument> {
@@ -244,12 +296,18 @@ impl StorageService {
     fn ensure_layout(&self) -> Result<()> {
         fs::create_dir_all(self.documents_dir())?;
         fs::create_dir_all(self.exports_dir())?;
+        fs::create_dir_all(self.corrupt_dir())?;
         fs::create_dir_all(self.codex_home_dir())?;
         Ok(())
     }
 
-    fn ensure_seed_data_locked(&self) -> Result<()> {
-        if self.read_documents_locked()?.is_empty() {
+    fn ensure_seed_data_locked(&self) -> Result<Vec<String>> {
+        let DocumentsReadResult {
+            documents,
+            recovery_notices,
+        } = self.read_documents_locked()?;
+
+        if documents.is_empty() {
             let timestamp = now_iso();
             let document = PersistedDocument {
                 id: Uuid::new_v4().to_string(),
@@ -297,6 +355,7 @@ impl StorageService {
                     "rapport".to_string(),
                     "logg".to_string(),
                 ],
+                content_revision: 0,
             };
 
             self.write_document_locked(&document)?;
@@ -306,11 +365,14 @@ impl StorageService {
             self.write_state_locked(&AppStateFile::default())?;
         }
 
-        Ok(())
+        Ok(recovery_notices)
     }
 
     fn workspace_for_document_locked(&self, document_id: &str) -> Result<WorkspaceSnapshot> {
-        let mut documents = self.read_documents_locked()?;
+        let DocumentsReadResult {
+            mut documents,
+            recovery_notices,
+        } = self.read_documents_locked()?;
         documents.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
 
         let active_document = documents
@@ -321,11 +383,14 @@ impl StorageService {
         Ok(WorkspaceSnapshot {
             documents: documents.iter().map(DocumentSummary::from).collect(),
             active_document: StoredDocument::from(active_document),
+            recovery_notices,
         })
     }
 
-    fn read_documents_locked(&self) -> Result<Vec<PersistedDocument>> {
+    fn read_documents_locked(&self) -> Result<DocumentsReadResult> {
         let mut documents = Vec::new();
+        let mut recovery_notices = Vec::new();
+
         for entry in fs::read_dir(self.documents_dir())? {
             let entry = entry?;
             let path = entry.path();
@@ -333,13 +398,30 @@ impl StorageService {
                 continue;
             }
 
-            let raw = fs::read_to_string(&path)?;
-            let document = serde_json::from_str::<PersistedDocument>(&raw)
-                .with_context(|| format!("Kunne ikke lese dokumentet {}", path.display()))?;
-            documents.push(document);
+            let raw = match fs::read_to_string(&path) {
+                Ok(raw) => raw,
+                Err(error) => {
+                    recovery_notices.push(self.quarantine_corrupt_file(
+                        &path,
+                        &format!("Kunne ikke lese dokumentfila: {error}"),
+                    )?);
+                    continue;
+                }
+            };
+
+            match serde_json::from_str::<PersistedDocument>(&raw) {
+                Ok(document) => documents.push(document),
+                Err(error) => recovery_notices.push(self.quarantine_corrupt_file(
+                    &path,
+                    &format!("Kunne ikke lese dokumentet som gyldig JSON: {error}"),
+                )?),
+            }
         }
 
-        Ok(documents)
+        Ok(DocumentsReadResult {
+            documents,
+            recovery_notices,
+        })
     }
 
     fn read_document_locked(&self, document_id: &str) -> Result<PersistedDocument> {
@@ -350,24 +432,132 @@ impl StorageService {
     }
 
     fn write_document_locked(&self, document: &PersistedDocument) -> Result<()> {
-        let payload = serde_json::to_string_pretty(document)?;
-        fs::write(self.document_path(&document.id), payload)?;
-        Ok(())
+        self.write_json_atomic(self.document_path(&document.id), document)
     }
 
-    fn read_state_locked(&self) -> Result<AppStateFile> {
+    fn read_state_locked(&self) -> Result<StateReadResult> {
         if !self.state_path().exists() {
-            return Ok(AppStateFile::default());
+            return Ok(StateReadResult {
+                state: AppStateFile::default(),
+                recovery_notices: Vec::new(),
+            });
         }
 
-        let raw = fs::read_to_string(self.state_path())?;
-        Ok(serde_json::from_str(&raw)?)
+        let state_path = self.state_path();
+        let raw = match fs::read_to_string(&state_path) {
+            Ok(raw) => raw,
+            Err(error) => {
+                return Ok(StateReadResult {
+                    state: AppStateFile::default(),
+                    recovery_notices: vec![self.quarantine_corrupt_file(
+                        &state_path,
+                        &format!("Kunne ikke lese tilstandsfilen: {error}"),
+                    )?],
+                });
+            }
+        };
+
+        match serde_json::from_str::<AppStateFile>(&raw) {
+            Ok(state) => Ok(StateReadResult {
+                state,
+                recovery_notices: Vec::new(),
+            }),
+            Err(error) => Ok(StateReadResult {
+                state: AppStateFile::default(),
+                recovery_notices: vec![self.quarantine_corrupt_file(
+                    &state_path,
+                    &format!("Kunne ikke lese tilstandsfilen som gyldig JSON: {error}"),
+                )?],
+            }),
+        }
     }
 
     fn write_state_locked(&self, state: &AppStateFile) -> Result<()> {
-        let payload = serde_json::to_string_pretty(state)?;
-        fs::write(self.state_path(), payload)?;
+        self.write_json_atomic(self.state_path(), state)
+    }
+
+    fn write_json_atomic<T: Serialize>(&self, path: PathBuf, value: &T) -> Result<()> {
+        let payload = serde_json::to_vec_pretty(value)?;
+        self.write_bytes_atomic(&path, &payload)
+    }
+
+    fn write_bytes_atomic(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let temp_path = path.with_file_name(format!(
+            "{}.{}.tmp",
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("lokal-skriveflate"),
+            Uuid::new_v4()
+        ));
+
+        let mut file = File::options()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)
+            .with_context(|| {
+                format!(
+                    "Kunne ikke opprette midlertidig fil {}",
+                    temp_path.display()
+                )
+            })?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+
+        fs::rename(&temp_path, path).with_context(|| {
+            format!(
+                "Kunne ikke flytte {} til {}",
+                temp_path.display(),
+                path.display()
+            )
+        })?;
+
+        if let Some(parent) = path.parent() {
+            if let Ok(directory) = File::open(parent) {
+                let _ = directory.sync_all();
+            }
+        }
+
         Ok(())
+    }
+
+    fn quarantine_corrupt_file(&self, path: &Path, reason: &str) -> Result<String> {
+        fs::create_dir_all(self.corrupt_dir())?;
+
+        let filename = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("ukjent-fil");
+        let target = self.corrupt_dir().join(format!(
+            "{}-{}-{}",
+            Utc::now().format("%Y%m%d-%H%M%S"),
+            Uuid::new_v4(),
+            filename
+        ));
+
+        if path.exists() {
+            fs::rename(path, &target)
+                .or_else(|_| {
+                    fs::copy(path, &target)?;
+                    fs::remove_file(path)
+                })
+                .with_context(|| {
+                    format!(
+                        "Kunne ikke flytte korrupt fil {} til {}",
+                        path.display(),
+                        target.display()
+                    )
+                })?;
+        }
+
+        Ok(format!(
+            "Flyttet en korrupt fil ({filename}) til {}. {reason}",
+            target.display()
+        ))
     }
 
     fn state_path(&self) -> PathBuf {
@@ -382,8 +572,20 @@ impl StorageService {
         self.root.join("exports")
     }
 
+    fn corrupt_dir(&self) -> PathBuf {
+        self.root.join("corrupt")
+    }
+
     fn document_path(&self, document_id: &str) -> PathBuf {
         self.documents_dir().join(format!("{document_id}.json"))
+    }
+}
+
+fn extend_notices(target: &mut Vec<String>, notices: Vec<String>) {
+    for notice in notices {
+        if !target.contains(&notice) {
+            target.push(notice);
+        }
     }
 }
 
@@ -405,6 +607,15 @@ fn slugify(value: &str) -> String {
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>()
         .join("-")
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#039;")
 }
 
 fn system_message(text: &str) -> crate::models::ChatMessage {
@@ -434,10 +645,75 @@ fn user_message(text: &str) -> crate::models::ChatMessage {
     }
 }
 
-#[allow(dead_code)]
-fn _ensure_path(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::OutputFormat;
+
+    fn temp_root() -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("lokal-skriveflate-storage-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&path).unwrap();
+        path
     }
-    Ok(())
+
+    #[test]
+    fn bootstrap_quarantines_corrupt_documents_and_returns_notices() {
+        let root = temp_root();
+        let service = StorageService::new(root.clone()).unwrap();
+        let document_path = root.join("documents").join("broken.json");
+        fs::write(&document_path, "{not-json").unwrap();
+
+        let bootstrap = service.bootstrap().unwrap();
+
+        assert!(!bootstrap.workspace.recovery_notices.is_empty());
+        assert!(!document_path.exists());
+        assert!(fs::read_dir(root.join("corrupt")).unwrap().next().is_some());
+    }
+
+    #[test]
+    fn save_document_increments_content_revision() {
+        let root = temp_root();
+        let service = StorageService::new(root).unwrap();
+        let bootstrap = service.bootstrap().unwrap();
+        let document = bootstrap.workspace.active_document;
+
+        let saved = service
+            .save_document(SaveDocumentRequest {
+                id: document.id.clone(),
+                title: format!("{} oppdatert", document.title),
+                content: document.content.clone(),
+                html: document.html.clone(),
+                plain_text: document.plain_text.clone(),
+            })
+            .unwrap();
+
+        assert_eq!(saved.content_revision, document.content_revision + 1);
+    }
+
+    #[test]
+    fn export_document_sanitizes_html_title() {
+        let root = temp_root();
+        let service = StorageService::new(root.clone()).unwrap();
+        let bootstrap = service.bootstrap().unwrap();
+        let document = bootstrap.workspace.active_document;
+
+        service
+            .save_document(SaveDocumentRequest {
+                id: document.id.clone(),
+                title: "</title><script>alert(1)</script>".to_string(),
+                content: document.content,
+                html: "<p>Hei</p><script>alert(1)</script>".to_string(),
+                plain_text: "Hei".to_string(),
+            })
+            .unwrap();
+
+        let export = service
+            .export_document(&document.id, OutputFormat::Html)
+            .unwrap();
+        let html = fs::read_to_string(export.path).unwrap();
+
+        assert!(html.contains("&lt;/title&gt;&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(!html.contains("<script>alert(1)</script>"));
+    }
 }

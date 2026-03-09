@@ -40,7 +40,10 @@ fn escape_pdf_text(value: &str) -> String {
 }
 
 pub fn render_text_pdf(input: &str) -> Result<Vec<u8>> {
-    let wrapped_lines = wrap_text(input, 88);
+    let mut wrapped_lines = wrap_text(input, 88);
+    if wrapped_lines.is_empty() {
+        wrapped_lines.push(String::new());
+    }
     let lines_per_page = 48;
     let pages = wrapped_lines
         .chunks(lines_per_page)
@@ -118,4 +121,18 @@ pub fn render_text_pdf(input: &str) -> Result<Vec<u8>> {
     );
 
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_text_pdf;
+
+    #[test]
+    fn empty_input_still_produces_a_page() {
+        let pdf = render_text_pdf("").unwrap();
+        let content = String::from_utf8_lossy(&pdf);
+
+        assert!(content.contains("/Count 1"));
+        assert!(content.contains("/Type /Page"));
+    }
 }

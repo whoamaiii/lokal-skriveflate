@@ -33,6 +33,8 @@ pub struct PersistedDocument {
     pub messages: Vec<ChatMessage>,
     pub snapshots: Vec<DocumentSnapshot>,
     pub workflow_hints: Vec<String>,
+    #[serde(default)]
+    pub content_revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +51,7 @@ pub struct StoredDocument {
     pub thread_id: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub snapshot_count: usize,
+    pub content_revision: u64,
 }
 
 impl From<&PersistedDocument> for StoredDocument {
@@ -66,6 +69,7 @@ impl From<&PersistedDocument> for StoredDocument {
             thread_id: value.thread_id.clone(),
             messages: value.messages.clone(),
             snapshot_count: value.snapshots.len(),
+            content_revision: value.content_revision,
         }
     }
 }
@@ -174,6 +178,8 @@ pub struct WorkflowModule {
 pub struct WorkspaceSnapshot {
     pub documents: Vec<DocumentSummary>,
     pub active_document: StoredDocument,
+    #[serde(default)]
+    pub recovery_notices: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +189,8 @@ pub struct AppBootstrap {
     pub runtime_status: RuntimeStatus,
     pub settings: AppSettings,
     pub workflow_modules: Vec<WorkflowModule>,
+    #[serde(default)]
+    pub recovery_notices: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,6 +205,7 @@ pub struct SaveDocumentRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantTurnRequest {
     pub document_id: String,
+    pub document_revision: u64,
     pub prompt: String,
     pub quick_action: Option<String>,
     pub tone: String,
@@ -257,13 +266,15 @@ pub fn default_workflows() -> Vec<WorkflowModule> {
         WorkflowModule {
             id: "log_workflow".to_string(),
             name: "Loggflyt".to_string(),
-            description: "Planlagt modul for løpende loggføring, dagnotater og dokumentasjon.".to_string(),
+            description: "Planlagt modul for løpende loggføring, dagnotater og dokumentasjon."
+                .to_string(),
             status: "planned".to_string(),
         },
         WorkflowModule {
             id: "project_workflow".to_string(),
             name: "Prosjektflyt".to_string(),
-            description: "Planlagt modul for prosjektplaner, møtenotater og oppfølging.".to_string(),
+            description: "Planlagt modul for prosjektplaner, møtenotater og oppfølging."
+                .to_string(),
             status: "planned".to_string(),
         },
     ]
