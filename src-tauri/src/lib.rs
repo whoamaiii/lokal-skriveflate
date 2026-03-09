@@ -7,10 +7,17 @@ mod storage;
 use anyhow::{Context, Result};
 use tauri::Manager;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tracing::info;
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 
 use crate::{agent::AgentService, storage::StorageService};
+
+static TRACING_GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
 
 pub struct AppState {
     pub storage: StorageService,
@@ -51,6 +58,12 @@ fn build_state(app: &tauri::AppHandle) -> Result<AppState> {
     let app_version = app.package_info().version.to_string();
 
     std::fs::create_dir_all(&app_data_dir)?;
+    info!(
+        app_data_dir = %app_data_dir.display(),
+        resource_root = %resource_root.display(),
+        version = %app_version,
+        "bygger app-tilstand"
+    );
 
     Ok(AppState {
         storage: StorageService::new(app_data_dir.clone())?,
@@ -88,12 +101,33 @@ fn resolve_resource_root(app: &tauri::AppHandle) -> Result<std::path::PathBuf> {
         .context("Fant ikke bundlet runtime-ressursmappe")
 }
 
+fn init_tracing(app: &tauri::AppHandle) -> Result<()> {
+    let log_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?
+        .join("logs");
+    std::fs::create_dir_all(&log_dir)?;
+
+    let file_appender = tracing_appender::rolling::never(&log_dir, "lokal-skriveflate.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+    let subscriber = tracing_subscriber::registry()
+        .with(EnvFilter::new("info"))
+        .with(fmt::layer().with_ansi(false).with_writer(non_blocking));
+
+    let _ = TRACING_GUARD.set(guard);
+    let _ = tracing::subscriber::set_global_default(subscriber);
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .setup(|app| {
+            init_tracing(&app.handle())?;
             let state = build_state(&app.handle())?;
             app.manage(state);
+            info!("lokal skriveflate startet");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -109,6 +143,17 @@ pub fn run() {
             commands::export_document,
             commands::save_settings,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running lokal skriveflate");
+        .build(tauri::generate_context!())
+        .expect("error while building lokal skriveflate");
+
+    app.run(|app_handle, event| {
+        if matches!(
+            event,
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+        ) {
+            info!("mottok avslutning, stopper lokal runtime");
+            let state = app_handle.state::<AppState>();
+            let _ = tauri::async_runtime::block_on(async { state.agent.shutdown().await });
+        }
+    });
 }

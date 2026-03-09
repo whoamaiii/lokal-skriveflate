@@ -10,13 +10,13 @@ import { AlertTriangle, RefreshCcw } from "lucide-react";
 import type {
   AppBootstrap,
   AssistantTurnInput,
+  CommandError,
   EditorSelection,
   PendingActionPreview,
   StoredDocument,
   WorkspaceSnapshot,
 } from "./types";
 import {
-  activateModel,
   bootstrapApp,
   createDocument,
   exportDocument,
@@ -50,10 +50,10 @@ import type { ToolbarActionId } from "./components/editorToolbar";
 
 const MOBILE_NAV_BREAKPOINT = "(max-width: 1180px)";
 const AUTOSAVE_DELAY_MS = 700;
-const DOCUMENT_CONFLICT_PREFIX = "document_conflict:";
 
 type RetryAction = (() => Promise<unknown> | unknown) | null;
 type DrawerSide = "left" | "right";
+type PendingActionMap = Record<string, PendingActionPreview>;
 
 function updateStoredDocument(
   document: StoredDocument,
@@ -91,6 +91,16 @@ function applyWorkspaceSnapshot(
 }
 
 function extractErrorMessage(error: unknown, fallback: string) {
+  if (
+    error &&
+    typeof error === "object" &&
+    "message" in error &&
+    typeof (error as { message: unknown }).message === "string" &&
+    (error as { message: string }).message.trim()
+  ) {
+    return (error as { message: string }).message;
+  }
+
   if (error instanceof Error && error.message.trim()) {
     return error.message;
   }
@@ -102,14 +112,18 @@ function extractErrorMessage(error: unknown, fallback: string) {
   return fallback;
 }
 
-function isDocumentConflictError(error: unknown) {
-  return extractErrorMessage(error, "").startsWith(DOCUMENT_CONFLICT_PREFIX);
+function isCommandError(error: unknown): error is CommandError {
+  return Boolean(
+    error &&
+      typeof error === "object" &&
+      "code" in error &&
+      "message" in error &&
+      "retryable" in error,
+  );
 }
 
-function stripDocumentConflictPrefix(message: string) {
-  return message.startsWith(DOCUMENT_CONFLICT_PREFIX)
-    ? message.slice(DOCUMENT_CONFLICT_PREFIX.length).trim()
-    : message;
+function isDocumentConflictError(error: unknown) {
+  return isCommandError(error) && error.code === "document_conflict";
 }
 
 function matchCompactLayout() {
@@ -126,7 +140,8 @@ export default function App() {
     from: 1,
     to: 1,
   });
-  const [pendingAction, setPendingAction] = useState<PendingActionPreview | null>(null);
+  const [pendingActionsByDocument, setPendingActionsByDocument] =
+    useState<PendingActionMap>({});
   const [isSending, setIsSending] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [bootstrapError, setBootstrapError] = useState<string | null>(null);
@@ -169,6 +184,9 @@ export default function App() {
 
   const activeDocument = workspace?.active_document ?? null;
   workspaceRef.current = workspace;
+  const activePendingAction = activeDocument
+    ? pendingActionsByDocument[activeDocument.id] ?? null
+    : null;
 
   const setFocusedZone = useEffectEvent((section: NavSection) => {
     setActiveNav(section);
@@ -322,6 +340,18 @@ export default function App() {
     setRuntimeError(null);
     setRuntimeRetryLabel(null);
     runtimeRetryRef.current = null;
+  }
+
+  function clearPendingAction(documentId: string) {
+    setPendingActionsByDocument((current) => {
+      if (!current[documentId]) {
+        return current;
+      }
+
+      const next = { ...current };
+      delete next[documentId];
+      return next;
+    });
   }
 
   function showRuntimeAlert(
@@ -563,12 +593,22 @@ export default function App() {
     : 0;
 
   const pendingActionIsStale = Boolean(
-    pendingAction &&
+    activePendingAction &&
       (!activeDocument ||
-        pendingAction.document_id !== activeDocument.id ||
-        pendingAction.document_revision !== activeDocument.content_revision ||
+        activePendingAction.document_id !== activeDocument.id ||
+        activePendingAction.document_revision !== activeDocument.content_revision ||
         hasUnsavedChanges(activeDocument)),
   );
+  const previewStateByDocumentId = Object.fromEntries(
+    Object.entries(pendingActionsByDocument).map(([documentId, preview]) => [
+      documentId,
+      documentId === activeDocument?.id &&
+      (preview.document_revision !== activeDocument.content_revision ||
+        hasUnsavedChanges(activeDocument))
+        ? "stale"
+        : "ready",
+    ]),
+  ) as Record<string, "ready" | "stale">;
 
   const workspaceRetryAction = useMemo(
     () =>
@@ -646,7 +686,6 @@ export default function App() {
       startTransition(() => {
         setWorkspace((current) => applyWorkspaceSnapshot(current, snapshot));
         setRecoveryNotices(snapshot.recovery_notices);
-        setPendingAction(null);
         setPrompt("");
       });
       focusWorkspace(true);
@@ -668,7 +707,6 @@ export default function App() {
       startTransition(() => {
         setWorkspace((current) => applyWorkspaceSnapshot(current, snapshot));
         setRecoveryNotices(snapshot.recovery_notices);
-        setPendingAction(null);
         setPrompt("");
       });
       focusWorkspace(true);
@@ -689,7 +727,6 @@ export default function App() {
       startTransition(() => {
         setWorkspace((current) => applyWorkspaceSnapshot(current, snapshot));
         setRecoveryNotices(snapshot.recovery_notices);
-        setPendingAction(null);
       });
       focusWorkspace();
     } catch (error) {
@@ -764,24 +801,31 @@ export default function App() {
           };
         });
 
-        const activeId = workspaceRef.current?.active_document.id;
-        setPendingAction(
-          result.editor_action && activeId === result.document.id
-            ? {
-                action: result.editor_action,
-                document_id: result.document.id,
-                document_revision: result.document.content_revision,
-                selection_from: selectionSnapshot.from,
-                selection_to: selectionSnapshot.to,
-              }
-            : null,
-        );
+        setPendingActionsByDocument((current) => {
+          const next = { ...current };
+
+          if (result.editor_action) {
+            next[result.document.id] = {
+              action: result.editor_action,
+              document_id: result.document.id,
+              document_revision: result.document.content_revision,
+              selection_from: selectionSnapshot.from,
+              selection_to: selectionSnapshot.to,
+              created_at: new Date().toISOString(),
+            };
+          } else {
+            delete next[result.document.id];
+          }
+
+          return next;
+        });
         setPrompt("");
       });
       focusWorkspace();
     } catch (error) {
-      const nextMessage = stripDocumentConflictPrefix(
-        extractErrorMessage(error, "Lokal AI kunne ikke svare akkurat nå."),
+      const nextMessage = extractErrorMessage(
+        error,
+        "Lokal AI kunne ikke svare akkurat nå.",
       );
       showRuntimeAlert(nextMessage);
 
@@ -803,7 +847,7 @@ export default function App() {
   }
 
   function handleApplyAction() {
-    if (!pendingAction || !activeDocument) {
+    if (!activePendingAction || !activeDocument) {
       return;
     }
 
@@ -811,12 +855,12 @@ export default function App() {
       showWorkspaceAlert(
         "Forslaget er utdatert fordi dokumentet ble endret. Be om et nytt forslag før du setter inn tekst.",
       );
-      setPendingAction(null);
+      clearPendingAction(activeDocument.id);
       return;
     }
 
-    editorRef.current?.applyAction(pendingAction);
-    setPendingAction(null);
+    editorRef.current?.applyAction(activePendingAction);
+    clearPendingAction(activeDocument.id);
     clearWorkspaceAlert();
     focusWorkspace();
   }
@@ -931,27 +975,6 @@ export default function App() {
         extractErrorMessage(error, "Kunne ikke oppdatere lokal AI."),
         action === "prepare" ? "Prøv å klargjøre igjen" : "Prøv å reparere igjen",
         () => handleSetupAction(action),
-      );
-      try {
-        await handleRefreshRuntime();
-      } catch {
-        // handleRefreshRuntime already updated the workspace error state.
-      }
-    } finally {
-      setIsRuntimeActionPending(false);
-    }
-  }
-
-  async function handleModelChange(modelId: string) {
-    setIsRuntimeActionPending(true);
-    try {
-      const result = await activateModel(modelId);
-      applyRuntimeAction(result.message, result.runtime_status, result.settings);
-    } catch (error) {
-      showRuntimeAlert(
-        extractErrorMessage(error, "Kunne ikke bytte modell."),
-        "Prøv å bytte igjen",
-        () => handleModelChange(modelId),
       );
       try {
         await handleRefreshRuntime();
@@ -1078,9 +1101,9 @@ export default function App() {
           panelRef={(node) => {
             leftDrawerRef.current = node;
           }}
+          previewStateByDocumentId={previewStateByDocumentId}
           recoveryNotices={recoveryNotices}
           selection={selection}
-          workflows={workspace.workflow_modules}
           wordCount={wordCount}
         />
 
@@ -1137,13 +1160,13 @@ export default function App() {
             />
           </section>
 
-          {pendingAction ? (
+          {activePendingAction ? (
             <div className="floating-preview-tray">
               <ActionPreview
-                action={pendingAction.action}
+                action={activePendingAction.action}
                 isStale={pendingActionIsStale}
                 onApply={handleApplyAction}
-                onDismiss={() => setPendingAction(null)}
+                onDismiss={() => clearPendingAction(activeDocument.id)}
               />
             </div>
           ) : null}
@@ -1157,7 +1180,6 @@ export default function App() {
           isSending={isSending}
           messages={activeDocument.messages}
           onActivate={() => setFocusedZone("user")}
-          onActivateModel={(modelId) => void handleModelChange(modelId)}
           onPrepareLocalAi={() => void handleSetupAction("prepare")}
           onPromptChange={setPrompt}
           onQuickAction={(actionId) => void handleSend(actionId)}

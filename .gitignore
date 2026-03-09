@@ -1,4 +1,8 @@
 node_modules
+node_modules.bak*
 dist
 src-tauri/target
+src-tauri/binaries
+src-tauri/resources/embedded-runtime/staged
+.codex-smoke-home*
 .DS_Store

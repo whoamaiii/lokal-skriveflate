@@ -33,7 +33,6 @@ interface ChatPaneProps {
   onQuickAction: (actionId: string) => void;
   onPrepareLocalAi: () => void;
   onRepairLocalAi: () => void;
-  onActivateModel: (modelId: string) => void;
   onRefreshRuntime: () => void;
   onRetryRuntimeAction?: () => void;
   onActivate?: () => void;
@@ -59,7 +58,6 @@ export function ChatPane({
   onQuickAction,
   onPrepareLocalAi,
   onRepairLocalAi,
-  onActivateModel,
   onRefreshRuntime,
   onRetryRuntimeAction,
   onActivate,
@@ -68,12 +66,11 @@ export function ChatPane({
   className,
   ariaHidden,
 }: ChatPaneProps) {
-  const modelReady =
-    runtimeStatus.codex.available &&
-    runtimeStatus.local_ai.running &&
-    runtimeStatus.runtime_state === "ready";
+  const canSend = runtimeStatus.can_send;
+  const willWarmUpOnSend =
+    runtimeStatus.will_start_on_demand && !runtimeStatus.local_ai.running;
   const [activeTab, setActiveTab] = useState<AssistantPanelTab>(() =>
-    modelReady ? "chat" : "system",
+    canSend ? "chat" : "system",
   );
   const assistantTabRefs = useRef<Record<AssistantPanelTab, HTMLButtonElement | null>>({
     chat: null,
@@ -81,16 +78,20 @@ export function ChatPane({
     system: null,
   });
   const systemTabHasStatus = Boolean(
-    runtimeNotice || runtimeError || isRuntimeActionPending || !modelReady,
+    runtimeNotice || runtimeError || isRuntimeActionPending || !canSend,
   );
-  const showChatSetupNotice = !modelReady;
+  const showChatSetupNotice = !canSend;
+  const activeModel =
+    runtimeStatus.available_models.find((model) => model.active) ??
+    runtimeStatus.available_models[0] ??
+    null;
 
   const setupText = (() => {
     switch (runtimeStatus.runtime_state) {
       case "ready":
         return "Lokal AI kjører via bundlet runtime. Dokumentforslag blir laget uten nett.";
       case "degraded":
-        return "Lokal AI er klargjort, men ikke i gang akkurat nå. Den startes ved første forespørsel eller etter reparasjon.";
+        return "Lokal AI er klargjort, men ikke i gang akkurat nå. Den startes ved første forespørsel.";
       case "repair_required":
         return "Runtime eller modell trenger reparasjon. Appen har oppdaget avvik i de lokale filene.";
       case "extracting":
@@ -145,8 +146,8 @@ export function ChatPane({
           <p className="eyebrow">Lokal skriveassistent</p>
           <h2>Chat og kommandoer</h2>
         </div>
-        <span className={`status-dot ${modelReady ? "ready" : "offline"}`}>
-          {modelReady ? "Klar" : "Oppsett"}
+        <span className={`status-dot ${canSend ? "ready" : "offline"}`}>
+          {runtimeStatus.local_ai.running ? "Klar" : canSend ? "Starter ved behov" : "Oppsett"}
         </span>
       </div>
 
@@ -238,6 +239,12 @@ export function ChatPane({
                 </button>
               </div>
             ) : null}
+            {!showChatSetupNotice && willWarmUpOnSend ? (
+              <div className="chat-setup-notice" role="status">
+                <strong>Lokal AI starter ved første forespørsel</strong>
+                <p>Første svar kan ta litt lengre tid fordi runtime startes ved behov.</p>
+              </div>
+            ) : null}
             <label className="tone-control">
               Tone
               <select value={tone} onChange={(event) => onToneChange(event.target.value)}>
@@ -255,12 +262,12 @@ export function ChatPane({
             />
             <button
               className="primary-button send-button"
-              disabled={!modelReady || isSending || !prompt.trim()}
+              disabled={!canSend || isSending || !prompt.trim()}
               onClick={onSend}
               type="button"
             >
               {isSending ? <LoaderCircle className="spinning" size={16} /> : <Play size={16} />}
-              Send til lokal motor
+              {isSending && willWarmUpOnSend ? "Starter lokal motor..." : "Send til lokal motor"}
             </button>
             <p className="chat-footnote">
               <Rocket size={13} />
@@ -283,7 +290,7 @@ export function ChatPane({
             {quickActions.map((action) => (
               <button
                 className="quick-action-button"
-                disabled={!modelReady || isSending}
+                disabled={!canSend || isSending}
                 key={action.id}
                 onClick={() => onQuickAction(action.id)}
                 type="button"
@@ -339,21 +346,11 @@ export function ChatPane({
                 Reparer
               </button>
             </div>
-            <label className="tone-control">
-              Modellpakke
-              <select
-                disabled={isRuntimeActionPending}
-                onChange={(event) => onActivateModel(event.target.value)}
-                value={runtimeStatus.selected_model}
-              >
-                {runtimeStatus.available_models.map((model) => (
-                  <option disabled={!model.installed && !model.active} key={model.id} value={model.id}>
-                    {model.tier}: {model.label}
-                    {model.installed ? "" : " (ikke klar)"}
-                  </option>
-                ))}
-              </select>
-            </label>
+            {activeModel ? (
+              <div className="setup-detail">
+                Standardmodell: {activeModel.label}
+              </div>
+            ) : null}
             {runtimeNotice ? <p className="setup-note ok">{runtimeNotice}</p> : null}
             {runtimeError ? (
               <p className="setup-note error">

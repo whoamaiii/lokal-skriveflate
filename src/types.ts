@@ -1,7 +1,6 @@
 import type { JSONContent } from "@tiptap/core";
 
 export type MessageRole = "user" | "assistant" | "system";
-export type WorkflowStatus = "planned" | "active";
 export type OutputFormat = "html" | "pdf" | "txt";
 export type RuntimeState =
   | "not_prepared"
@@ -9,11 +8,27 @@ export type RuntimeState =
   | "ready"
   | "degraded"
   | "repair_required";
+export type RuntimeBlockingReason =
+  | "codex_unavailable"
+  | "runtime_not_prepared"
+  | "runtime_repair_required"
+  | "runtime_start_failed"
+  | "unknown";
 export type EditorActionType =
   | "replace_selection"
   | "insert_after_cursor"
   | "append_to_document"
   | "create_new_section";
+export type CommandErrorCode =
+  | "document_conflict"
+  | "runtime_not_ready"
+  | "runtime_start_failed"
+  | "runtime_repair_required"
+  | "assistant_timeout"
+  | "assistant_bridge_error"
+  | "export_failed"
+  | "storage_error"
+  | "unknown";
 
 export interface ChatMessage {
   id: string;
@@ -41,6 +56,7 @@ export interface PendingActionPreview {
   document_revision: number;
   selection_from: number;
   selection_to: number;
+  created_at: string;
 }
 
 export interface DocumentSummary {
@@ -60,13 +76,6 @@ export interface StoredDocument extends DocumentSummary {
   thread_id: string | null;
   messages: ChatMessage[];
   snapshot_count: number;
-}
-
-export interface WorkflowModule {
-  id: string;
-  name: string;
-  description: string;
-  status: WorkflowStatus;
 }
 
 export interface RuntimeComponentStatus {
@@ -90,11 +99,21 @@ export interface RuntimeStatus {
   local_only: boolean;
   selected_model: string;
   runtime_state: RuntimeState;
+  can_send: boolean;
+  will_start_on_demand: boolean;
+  blocking_reason: RuntimeBlockingReason | null;
   codex: RuntimeComponentStatus;
   local_ai: RuntimeComponentStatus;
   available_models: LocalModelOption[];
   runtime_home: string | null;
   listen_address: string | null;
+}
+
+export interface CommandError {
+  code: CommandErrorCode;
+  message: string;
+  retryable: boolean;
+  action?: string | null;
 }
 
 export interface AppSettings {
@@ -107,7 +126,6 @@ export interface AppBootstrap {
   active_document: StoredDocument;
   runtime_status: RuntimeStatus;
   settings: AppSettings;
-  workflow_modules: WorkflowModule[];
   recovery_notices: string[];
 }
 

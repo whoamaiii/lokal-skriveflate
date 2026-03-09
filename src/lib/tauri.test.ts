@@ -44,7 +44,9 @@ describe("tauri bridge", () => {
     const bootstrap = await bootstrapApp();
 
     expect(result.editor_action?.content).toContain("Neste forslag");
-    expect(result.document.messages.at(-1)?.role).toBe("assistant");
+    expect(
+      result.document.messages[result.document.messages.length - 1]?.role,
+    ).toBe("assistant");
     expect(
       bootstrap.documents.some((document) => document.id === created.active_document.id),
     ).toBe(true);

@@ -1,5 +1,6 @@
 pub mod codex_bridge;
 pub mod local_model;
+pub mod responses_proxy;
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -46,6 +47,10 @@ impl AgentService {
 
     pub async fn activate_model(&self, model: &str) -> Result<String> {
         self.provider.activate_model(model).await
+    }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        self.provider.shutdown().await
     }
 
     pub async fn run_assistant_turn(
@@ -185,11 +190,6 @@ App contract:
 - If you propose text for the document, put it in editor_action.content as plain text.
 - Do not use markdown code fences.
 - Be practical, concise, and useful.
-
-Future workflow placeholders exist but are not implemented yet:
-- report_workflow
-- log_workflow
-- project_workflow
 
 Quick action guidance:
 {quick_action_instruction}

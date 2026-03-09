@@ -4,6 +4,7 @@ import type {
   AssistantTurnInput,
   AssistantTurnResult,
   ChatMessage,
+  CommandError,
   ExportResult,
   LocalModelOption,
   OutputFormat,
@@ -11,7 +12,6 @@ import type {
   RuntimeStatus,
   SaveDocumentInput,
   StoredDocument,
-  WorkflowModule,
   WorkspaceSnapshot,
 } from "../types";
 
@@ -25,47 +25,17 @@ type BrowserPreviewState = {
 
 const STORAGE_KEY = "lokal-skriveflate.browser-preview.v1";
 const BROWSER_THREAD_ID = "browser-preview-thread";
-const DEFAULT_MODEL_ID = "qwen3-4b-instruct-q4_k_m";
+const DEFAULT_MODEL_ID = "neurologg-q4_k_m";
 
 const AVAILABLE_MODELS: LocalModelOption[] = [
   {
     id: DEFAULT_MODEL_ID,
-    label: "Qwen3-4B-Instruct Q4_K_M",
+    label: "Neurologg Q4_K_M",
     tier: "Standard",
     bundled: true,
     installed: true,
     active: true,
     details: "Simulert standardmodell for nettleserforhåndsvisning.",
-  },
-  {
-    id: "qwen3-8b-instruct-q4_k_m",
-    label: "Qwen3-8B-Instruct Q4_K_M",
-    tier: "Kvalitet",
-    bundled: true,
-    installed: true,
-    active: false,
-    details: "Simulert kvalitetsmodell for nettleserforhåndsvisning.",
-  },
-];
-
-const WORKFLOW_MODULES: WorkflowModule[] = [
-  {
-    id: "report_workflow",
-    name: "Rapportflyt",
-    description: "Planlagt modul for rapportmaler og kvalitetssikret struktur.",
-    status: "planned",
-  },
-  {
-    id: "log_workflow",
-    name: "Loggflyt",
-    description: "Planlagt modul for løpende loggføring, dagnotater og dokumentasjon.",
-    status: "planned",
-  },
-  {
-    id: "project_workflow",
-    name: "Prosjektflyt",
-    description: "Planlagt modul for prosjektplaner, møtenotater og oppfølging.",
-    status: "planned",
   },
 ];
 
@@ -143,12 +113,19 @@ function syncModels(selectedModel: string) {
   }));
 }
 
+function makeCommandError(error: CommandError): CommandError {
+  return error;
+}
+
 function createRuntimeStatus(selectedModel: string): RuntimeStatus {
   return {
     offline_mode: true,
     local_only: true,
     selected_model: selectedModel,
     runtime_state: "ready",
+    can_send: true,
+    will_start_on_demand: false,
+    blocking_reason: null,
     codex: {
       available: true,
       running: true,
@@ -204,7 +181,7 @@ function seedState(): BrowserPreviewState {
     title: "Velkommen til Lokal Skriveflate",
     plainText:
       "Dette er nettleserforhåndsvisningen av skriveflaten. Du kan redigere dokumentet, teste snarveier og se AI-preview uten at desktopbroen er lastet.\n\nNår du åpner Tauri-appen brukes den ekte lokale lagringen og runtime-en igjen.",
-    workflowHints: ["skriveassistent", "rapport", "logg"],
+    workflowHints: ["skriveassistent"],
     createdAt: new Date(now - 1000 * 60 * 60).toISOString(),
     updatedAt: new Date(now - 1000 * 60 * 8).toISOString(),
     messages: [
@@ -226,7 +203,7 @@ function seedState(): BrowserPreviewState {
     title: "Rapportutkast for uke 10",
     plainText:
       "Måloppnåelsen er stabil denne uken. Teamet har lukket to prioriterte saker og forbereder neste leveranse.\n\nForeslåtte neste steg: ferdigstille sammendrag, bekrefte risikoer og sende rapporten til gjennomlesing.",
-    workflowHints: ["rapport"],
+    workflowHints: ["skriveassistent"],
     createdAt: new Date(now - 1000 * 60 * 60 * 3).toISOString(),
     updatedAt: new Date(now - 1000 * 60 * 35).toISOString(),
   });
@@ -236,7 +213,7 @@ function seedState(): BrowserPreviewState {
     title: "Motenotat",
     plainText:
       "Status fra siste mote: beslutning om leveransevindu, ansvar for oppfolging og behov for kort sammendrag til ledelsen.",
-    workflowHints: ["mote", "logg"],
+    workflowHints: ["skriveassistent"],
     createdAt: new Date(now - 1000 * 60 * 60 * 8).toISOString(),
     updatedAt: new Date(now - 1000 * 60 * 90).toISOString(),
   });
@@ -527,7 +504,6 @@ export function bootstrapBrowserPreview(): AppBootstrap {
     ...snapshot,
     runtime_status: cloneValue(state.runtimeStatus),
     settings: cloneValue(state.settings),
-    workflow_modules: cloneValue(WORKFLOW_MODULES),
   };
 }
 
@@ -538,7 +514,7 @@ export function createBrowserPreviewDocument(title?: string): WorkspaceSnapshot 
     title: title?.trim() || "Nytt lokalt dokument",
     plainText:
       "Start her. Browserforhåndsvisningen lagrer dette lokalt i nettleseren, mens desktopappen bruker den ekte Tauri-lagringen.",
-    workflowHints: ["skriveassistent", "rapport"],
+      workflowHints: ["skriveassistent"],
     createdAt: timestamp,
     updatedAt: timestamp,
     messages: [
@@ -611,9 +587,13 @@ export function sendBrowserPreviewAssistantTurn(
   }
 
   if (currentDocument.content_revision !== request.document_revision) {
-    throw new Error(
-      "document_conflict: Dokumentet ble endret før preview-foresporselen kunne starte. Oppdater dokumentet og prov igjen.",
-    );
+    throw makeCommandError({
+      code: "document_conflict",
+      message:
+        "Dokumentet ble endret før preview-forespørselen kunne starte. Oppdater dokumentet og prøv igjen.",
+      retryable: true,
+      action: "reload_document",
+    });
   }
 
   const assistantReply = buildAssistantReply(request);
@@ -649,6 +629,9 @@ function applyRuntimeMessage(message: string) {
   state.runtimeStatus = {
     ...state.runtimeStatus,
     runtime_state: "ready",
+    can_send: true,
+    will_start_on_demand: false,
+    blocking_reason: null,
     codex: {
       ...state.runtimeStatus.codex,
       available: true,
@@ -686,7 +669,12 @@ export function activateBrowserPreviewModel(modelId: string): RuntimeActionResul
   const model = AVAILABLE_MODELS.find((entry) => entry.id === modelId);
 
   if (!model) {
-    throw new Error("Fant ikke modellen du prøvde å velge.");
+    throw makeCommandError({
+      code: "runtime_not_ready",
+      message: "Fant ikke modellen du prøvde å velge.",
+      retryable: false,
+      action: null,
+    });
   }
 
   state.settings.selected_model = modelId;

@@ -7,6 +7,9 @@ interface StatusStripProps {
 }
 
 export function StatusStrip({ runtimeStatus, compact = false }: StatusStripProps) {
+  const activeModel =
+    runtimeStatus.available_models.find((model) => model.active) ??
+    runtimeStatus.available_models[0];
   const runtimeLabel =
     runtimeStatus.runtime_state === "ready"
       ? "Klar"
@@ -39,7 +42,7 @@ export function StatusStrip({ runtimeStatus, compact = false }: StatusStripProps
         {runtimeStatus.local_ai.available ? "Runtime klargjort" : "Runtime mangler"}
       </div>
       <div className="status-pill subtle">
-        Modell: {runtimeStatus.selected_model}
+        Modell: {activeModel?.label ?? "Standardmodell"}
       </div>
     </footer>
   );

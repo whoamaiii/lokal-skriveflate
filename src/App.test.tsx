@@ -184,6 +184,9 @@ function makeRuntimeStatus(overrides: Partial<RuntimeStatus> = {}): RuntimeStatu
     local_only: true,
     selected_model: "lokal-4b",
     runtime_state: "ready",
+    can_send: true,
+    will_start_on_demand: false,
+    blocking_reason: null,
     codex: {
       available: true,
       running: true,
@@ -267,14 +270,6 @@ function makeBootstrap(
       selected_model: "lokal-4b",
       preferred_tone: "Klar og profesjonell",
     },
-    workflow_modules: [
-      {
-        id: "wf-1",
-        name: "Rapportflyt",
-        description: "Planlagt modul for rapportmaler og kvalitetssikret struktur.",
-        status: "planned",
-      },
-    ],
     recovery_notices: options.recoveryNotices ?? [],
   };
 }

@@ -1,12 +1,11 @@
 import type { KeyboardEvent, Ref } from "react";
 import { useRef } from "react";
-import { Download, FilePlus2, Save, Sparkles, Workflow, X } from "lucide-react";
+import { Download, FilePlus2, Save, Sparkles, X } from "lucide-react";
 import type {
   DocumentSummary,
   EditorSelection,
   OutputFormat,
   StoredDocument,
-  WorkflowModule,
 } from "../types";
 import { getNextHorizontalTabId } from "../lib/tabNavigation";
 import {
@@ -14,15 +13,15 @@ import {
   type ToolbarActionId,
 } from "./editorToolbar";
 
-export type LeftDrawerTab = "documents" | "tools" | "modules";
+export type LeftDrawerTab = "documents" | "tools";
 
-const LEFT_DRAWER_TABS: LeftDrawerTab[] = ["documents", "tools", "modules"];
+const LEFT_DRAWER_TABS: LeftDrawerTab[] = ["documents", "tools"];
 
 interface SidebarProps {
   documents: DocumentSummary[];
   activeDocument: StoredDocument;
   activeTab: LeftDrawerTab;
-  workflows: WorkflowModule[];
+  previewStateByDocumentId?: Record<string, "ready" | "stale">;
   recoveryNotices: string[];
   wordCount: number;
   selection: EditorSelection;
@@ -53,7 +52,7 @@ export function Sidebar({
   documents,
   activeDocument,
   activeTab,
-  workflows,
+  previewStateByDocumentId = {},
   recoveryNotices,
   wordCount,
   selection,
@@ -76,8 +75,20 @@ export function Sidebar({
   const tabRefs = useRef<Record<LeftDrawerTab, HTMLButtonElement | null>>({
     documents: null,
     tools: null,
-    modules: null,
   });
+
+  function previewLabel(documentId: string) {
+    const state = previewStateByDocumentId[documentId];
+    if (!state) {
+      return null;
+    }
+
+    return (
+      <span className={`document-preview-indicator ${state === "stale" ? "stale" : "ready"}`}>
+        {state === "stale" ? "AI-forslag utdatert" : "AI-forslag klart"}
+      </span>
+    );
+  }
 
   function activateTab(tab: LeftDrawerTab, shouldFocus = false) {
     onTabChange(tab);
@@ -160,22 +171,6 @@ export function Sidebar({
         >
           Verktøy
         </button>
-        <button
-          aria-controls="sidebar-modules-panel"
-          aria-selected={activeTab === "modules"}
-          className="panel-tab-button"
-          id="sidebar-modules-tab"
-          onClick={() => activateTab("modules")}
-          onKeyDown={(event) => handleTabKeyDown(event, "modules")}
-          ref={(node) => {
-            tabRefs.current.modules = node;
-          }}
-          role="tab"
-          tabIndex={activeTab === "modules" ? 0 : -1}
-          type="button"
-        >
-          Moduler
-        </button>
       </div>
 
       <div className="sidebar-body sidebar-drawer-body">
@@ -228,16 +223,10 @@ export function Sidebar({
             >
               <div className="document-card-top">
                 <strong>{activeDocument.title}</strong>
+                {previewLabel(activeDocument.id)}
                 <span>{formatUpdatedTime(activeDocument.updated_at)}</span>
               </div>
               <p>{activeDocument.preview || "Tomt dokument"}</p>
-              {activeDocument.workflow_hints.length > 0 ? (
-                <div className="document-tags">
-                  {activeDocument.workflow_hints.slice(0, 2).map((hint) => (
-                    <span key={hint}>{hint}</span>
-                  ))}
-                </div>
-              ) : null}
             </button>
           </section>
 
@@ -257,6 +246,7 @@ export function Sidebar({
                   >
                     <div className="recent-document-row-top">
                       <strong>{document.title}</strong>
+                      {previewLabel(document.id)}
                       <span>{formatUpdatedTime(document.updated_at)}</span>
                     </div>
                     <p>{document.preview || "Tomt dokument"}</p>
@@ -353,31 +343,6 @@ export function Sidebar({
           </section>
         </section>
 
-        <section
-          aria-labelledby="sidebar-modules-tab"
-          className="sidebar-tab-panel"
-          hidden={activeTab !== "modules"}
-          id="sidebar-modules-panel"
-          role="tabpanel"
-        >
-          <section className="sidebar-section">
-            <div className="section-title">
-              <Workflow size={15} />
-              Planlagte moduler
-            </div>
-            <div className="workflow-list compact-workflow-list">
-              {workflows.map((workflow) => (
-                <div className="workflow-card workflow-card-compact" key={workflow.id}>
-                  <div>
-                    <strong>{workflow.name}</strong>
-                    <span>{workflow.status === "planned" ? "Planlagt" : "Aktiv"}</span>
-                  </div>
-                  <p>{workflow.description}</p>
-                </div>
-              ))}
-            </div>
-          </section>
-        </section>
       </div>
     </aside>
   );

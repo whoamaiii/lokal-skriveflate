@@ -20,15 +20,21 @@ use tokio::{
     sync::Mutex,
     time::sleep,
 };
+use tracing::{info, warn};
 
 use crate::models::{
-    AppSettings, LocalModelOption, RuntimeComponentStatus, RuntimePhase, RuntimeStatus,
-    DEFAULT_MODEL, QUALITY_MODEL,
+    AppSettings, LocalModelOption, RuntimeBlockingReason, RuntimeComponentStatus, RuntimePhase,
+    RuntimeStatus, DEFAULT_MODEL,
 };
 
+use crate::agent::responses_proxy::{start_responses_proxy, ResponsesProxyHandle};
+
 const LOCAL_API_KEY: &str = "lokal-skriveflate";
+const LOCAL_RUNTIME_CTX_SIZE: &str = "16384";
 const RUNTIME_DIR_NAME: &str = "runtime";
 const RUNTIME_MANIFEST_RELATIVE_PATH: &str = "embedded-runtime/manifest.json";
+const RUNTIME_START_TIMEOUT_ATTEMPTS: usize = 240;
+const RUNTIME_START_TIMEOUT_STEP_MS: u64 = 500;
 
 #[allow(dead_code)]
 #[async_trait]
@@ -41,6 +47,7 @@ pub trait LocalModelProvider {
     async fn activate_model(&self, model: &str) -> Result<String>;
     async fn repair_runtime(&self, settings: &AppSettings) -> Result<String>;
     async fn runtime_endpoint(&self, settings: &AppSettings) -> Result<String>;
+    async fn shutdown(&self) -> Result<()>;
 }
 
 pub struct EmbeddedLlamaCppProvider {
@@ -56,7 +63,9 @@ pub struct EmbeddedLlamaCppProvider {
 struct ManagedRuntime {
     child: Child,
     port: u16,
+    _llama_port: u16,
     model_id: String,
+    proxy: ResponsesProxyHandle,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +77,10 @@ struct ShaCacheEntry {
 
 #[derive(Debug, Deserialize)]
 struct EmbeddedRuntimeManifest {
+    #[serde(default = "default_manifest_schema_version")]
+    schema_version: u32,
+    #[serde(default)]
+    bundle_version: String,
     engine: RuntimeEngineAsset,
     models: Vec<RuntimeModelAsset>,
 }
@@ -108,6 +121,23 @@ struct RuntimeInspection {
 }
 
 impl EmbeddedLlamaCppProvider {
+    fn allow_dev_overrides() -> bool {
+        cfg!(debug_assertions)
+    }
+
+    fn staged_sidecar_source(target_name: &str) -> Option<PathBuf> {
+        let cwd = env::current_dir().ok()?;
+        let binaries_dir = cwd.join("src-tauri").join("binaries");
+
+        [
+            binaries_dir.join(target_name),
+            binaries_dir.join(format!("{target_name}-aarch64-apple-darwin")),
+            binaries_dir.join(format!("{target_name}-x86_64-apple-darwin")),
+        ]
+        .into_iter()
+        .find(|path| path.exists())
+    }
+
     pub fn new(app_data_root: PathBuf, resource_root: PathBuf, app_version: String) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -124,6 +154,10 @@ impl EmbeddedLlamaCppProvider {
         self.app_data_root
             .join(RUNTIME_DIR_NAME)
             .join(&self.app_version)
+    }
+
+    fn runtime_log_dir(&self) -> PathBuf {
+        self.app_data_root.join("logs")
     }
 
     fn manifest_path(&self) -> PathBuf {
@@ -155,33 +189,103 @@ impl EmbeddedLlamaCppProvider {
         self.resource_root.join(&manifest.engine.resource)
     }
 
+    fn packaged_sidecar_source(target_name: &str) -> Option<PathBuf> {
+        let current_exe = env::current_exe().ok()?;
+        let executable_dir = current_exe.parent()?;
+
+        [
+            executable_dir.join(target_name),
+            executable_dir.join(format!("{target_name}-aarch64-apple-darwin")),
+            executable_dir.join(format!("{target_name}-x86_64-apple-darwin")),
+        ]
+        .into_iter()
+        .find(|path| path.exists())
+    }
+
+    fn packaged_sidecar_source_from_resource_root(&self, target_name: &str) -> Option<PathBuf> {
+        let resources_dir = self.resource_root.parent()?;
+        let contents_dir = resources_dir.parent()?;
+        let executable_dir = contents_dir.join("MacOS");
+
+        [
+            executable_dir.join(target_name),
+            executable_dir.join(format!("{target_name}-aarch64-apple-darwin")),
+            executable_dir.join(format!("{target_name}-x86_64-apple-darwin")),
+        ]
+        .into_iter()
+        .find(|path| path.exists())
+    }
+
     fn bundled_model_source(&self, model: &RuntimeModelAsset) -> PathBuf {
         self.resource_root.join(&model.resource)
     }
 
-    fn resolve_engine_source(&self, manifest: &EmbeddedRuntimeManifest) -> PathBuf {
-        env::var("LOKAL_AI_BINARY_PATH")
-            .ok()
-            .map(PathBuf::from)
-            .filter(|path| path.exists())
-            .unwrap_or_else(|| self.bundled_engine_source(manifest))
+    fn engine_library_source_dir(engine_source: &Path) -> Option<PathBuf> {
+        let executable_dir = engine_source.parent()?;
+        let sibling_dir = executable_dir.join("lib");
+        if sibling_dir.exists() {
+            return Some(sibling_dir);
+        }
+
+        executable_dir.parent().map(|parent| parent.join("lib")).filter(|path| path.exists())
     }
 
-    fn resolve_model_source(&self, model: &RuntimeModelAsset) -> PathBuf {
-        let override_key = match model.id.as_str() {
-            DEFAULT_MODEL => "LOKAL_AI_STANDARD_MODEL_PATH",
-            QUALITY_MODEL => "LOKAL_AI_QUALITY_MODEL_PATH",
-            _ => "",
-        };
-
-        if !override_key.is_empty() {
-            if let Some(path) = env::var(override_key)
+    fn resolve_engine_source(&self, manifest: &EmbeddedRuntimeManifest) -> Result<PathBuf> {
+        if Self::allow_dev_overrides() {
+            if let Some(path) = env::var("LOKAL_AI_BINARY_PATH")
                 .ok()
                 .map(PathBuf::from)
                 .filter(|path| path.exists())
             {
-                return path;
+                return Ok(path);
             }
+        }
+
+        if let Some(path) = self.packaged_sidecar_source_from_resource_root(&manifest.engine.target_name) {
+            return Ok(path);
+        }
+
+        if !Self::allow_dev_overrides() {
+            return Self::packaged_sidecar_source(&manifest.engine.target_name)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Fant ikke bundlet llama.cpp-sidecar `{}` i app-pakken.",
+                        manifest.engine.target_name
+                    )
+                });
+        }
+
+        let bundled = self.bundled_engine_source(manifest);
+        if bundled.exists() {
+            return Ok(bundled);
+        }
+
+        if let Some(path) = Self::staged_sidecar_source(&manifest.engine.target_name) {
+            return Ok(path);
+        }
+
+        Ok(bundled)
+    }
+
+    fn resolve_model_source(&self, model: &RuntimeModelAsset) -> PathBuf {
+        if !Self::allow_dev_overrides() {
+            return self.bundled_model_source(model);
+        }
+
+        if let Some(path) = env::var("LOKAL_AI_MODEL_PATH")
+            .ok()
+            .map(PathBuf::from)
+            .filter(|path| path.exists())
+        {
+            return path;
+        }
+
+        if let Some(path) = env::var("LOKAL_AI_STANDARD_MODEL_PATH")
+            .ok()
+            .map(PathBuf::from)
+            .filter(|path| path.exists())
+        {
+            return path;
         }
 
         self.bundled_model_source(model)
@@ -201,12 +305,6 @@ impl EmbeddedLlamaCppProvider {
                 manifest_path.display()
             )
         })
-    }
-
-    fn clear_sha_cache(&self) {
-        if let Ok(mut cache) = self.sha_cache.lock() {
-            cache.clear();
-        }
     }
 
     fn sha256_file(&self, path: &Path) -> Result<String> {
@@ -250,6 +348,12 @@ impl EmbeddedLlamaCppProvider {
         }
 
         Ok(digest)
+    }
+
+    fn clear_sha_cache(&self) {
+        if let Ok(mut cache) = self.sha_cache.lock() {
+            cache.clear();
+        }
     }
 
     fn inspect_asset(
@@ -303,6 +407,11 @@ impl EmbeddedLlamaCppProvider {
 
     fn inspect_runtime(&self) -> Result<RuntimeInspection> {
         let manifest = self.load_manifest()?;
+        info!(
+            schema_version = manifest.schema_version,
+            bundle_version = manifest.bundle_version,
+            "leser runtime-manifest"
+        );
         let runtime_home = self.runtime_home();
         let engine = self.inspect_asset(
             self.engine_target_path(&manifest),
@@ -397,7 +506,7 @@ impl EmbeddedLlamaCppProvider {
 
         let mut copied = 0usize;
 
-        let engine_source = self.resolve_engine_source(&manifest);
+        let engine_source = self.resolve_engine_source(&manifest)?;
         copied += usize::from(self.copy_asset(
             &engine_source,
             &self.engine_target_path(&manifest),
@@ -409,6 +518,7 @@ impl EmbeddedLlamaCppProvider {
             true,
             force,
         )?);
+        copied += self.copy_engine_libraries(&engine_source, force)?;
 
         for model in &manifest.models {
             let source = self.resolve_model_source(model);
@@ -439,11 +549,46 @@ impl EmbeddedLlamaCppProvider {
         Ok(copied)
     }
 
+    fn copy_engine_libraries(&self, engine_source: &Path, force: bool) -> Result<usize> {
+        let Some(source_dir) = Self::engine_library_source_dir(engine_source) else {
+            return Ok(0);
+        };
+
+        let target_dir = self.runtime_home().join("lib");
+        fs::create_dir_all(&target_dir)?;
+
+        let mut copied = 0usize;
+        for entry in fs::read_dir(&source_dir)
+            .with_context(|| format!("Kunne ikke lese støttebibliotekene i {}", source_dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            let is_dylib = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("dylib"));
+
+            if !is_dylib {
+                continue;
+            }
+
+            let target = target_dir.join(entry.file_name());
+            copied += usize::from(self.copy_asset(&path, &target, None, false, force)?);
+        }
+
+        Ok(copied)
+    }
+
     async fn current_runtime_snapshot(&self) -> Option<(u16, String)> {
         let mut guard = self.managed_runtime.lock().await;
         let Some(runtime) = guard.as_mut() else {
             return None;
         };
+
+        if runtime.proxy.is_finished() {
+            *guard = None;
+            return None;
+        }
 
         match runtime.child.try_wait() {
             Ok(Some(_)) => {
@@ -460,11 +605,13 @@ impl EmbeddedLlamaCppProvider {
 
     async fn stop_runtime_locked(&self) -> Result<()> {
         let mut guard = self.managed_runtime.lock().await;
-        let Some(mut runtime) = guard.take() else {
+        let Some(runtime) = guard.take() else {
             return Ok(());
         };
         drop(guard);
 
+        let mut runtime = runtime;
+        runtime.proxy.shutdown().await?;
         cleanup_child(&mut runtime.child).await
     }
 
@@ -486,15 +633,57 @@ impl EmbeddedLlamaCppProvider {
             .unwrap_or(false)
     }
 
-    async fn wait_for_health(&self, port: u16) -> Result<()> {
-        for _ in 0..40 {
+    fn runtime_stderr_log_path(&self, port: u16) -> PathBuf {
+        self.runtime_log_dir().join(format!("llama-server-{port}.stderr.log"))
+    }
+
+    fn read_log_tail(path: &Path, max_bytes: usize) -> String {
+        let Ok(bytes) = fs::read(path) else {
+            return String::new();
+        };
+
+        let start = bytes.len().saturating_sub(max_bytes);
+        String::from_utf8_lossy(&bytes[start..]).trim().to_string()
+    }
+
+    async fn wait_for_health(&self, port: u16, child: &mut Child, stderr_log_path: &Path) -> Result<()> {
+        for _ in 0..RUNTIME_START_TIMEOUT_ATTEMPTS {
             if self.healthcheck_port(port).await {
                 return Ok(());
             }
-            sleep(Duration::from_millis(500)).await;
+
+            if let Some(status) = child.try_wait()? {
+                let log_tail = Self::read_log_tail(stderr_log_path, 8 * 1024);
+                if log_tail.is_empty() {
+                    bail!(
+                        "Lokal runtime avsluttet før den ble klar på localhost:{port} (status: {status}). Se {}",
+                        stderr_log_path.display()
+                    );
+                }
+
+                bail!(
+                    "Lokal runtime avsluttet før den ble klar på localhost:{port} (status: {status}). Siste runtime-logg fra {}:\n{}",
+                    stderr_log_path.display(),
+                    log_tail
+                );
+            }
+
+            sleep(Duration::from_millis(RUNTIME_START_TIMEOUT_STEP_MS)).await;
         }
 
-        bail!("Lokal runtime startet ikke innen tidsfristen på localhost:{port}")
+        let log_tail = Self::read_log_tail(stderr_log_path, 8 * 1024);
+        if log_tail.is_empty() {
+            bail!(
+                "Lokal runtime startet ikke innen tidsfristen på localhost:{port}. Se {}",
+                stderr_log_path.display()
+            );
+        }
+
+        bail!(
+            "Lokal runtime startet ikke innen tidsfristen på localhost:{port}. Siste runtime-logg fra {}:\n{}",
+            stderr_log_path.display(),
+            log_tail
+        )
     }
 
     fn select_free_port(&self) -> Result<u16> {
@@ -605,7 +794,7 @@ impl EmbeddedLlamaCppProvider {
                 Some("Lokal runtime er klargjort og starter ved behov.".to_string())
             }
         } else {
-            Some("Valgt modell finnes ikke i katalogen.".to_string())
+            Some("Standardmodellen finnes ikke i runtime-katalogen.".to_string())
         };
 
         RuntimeComponentStatus {
@@ -623,6 +812,7 @@ impl EmbeddedLlamaCppProvider {
         inspection
             .models
             .iter()
+            .filter(|(model, _)| model.bundled || model.id == selected_model)
             .map(|(model, model_inspection)| LocalModelOption {
                 id: model.id.clone(),
                 label: model.label.clone(),
@@ -633,6 +823,27 @@ impl EmbeddedLlamaCppProvider {
                 details: model_inspection.details.clone(),
             })
             .collect()
+    }
+
+    fn readiness_for(
+        &self,
+        runtime_state: &RuntimePhase,
+        codex_available: bool,
+    ) -> (bool, bool, Option<RuntimeBlockingReason>) {
+        if !codex_available {
+            return (false, false, Some(RuntimeBlockingReason::CodexUnavailable));
+        }
+
+        match runtime_state {
+            RuntimePhase::Ready => (true, false, None),
+            RuntimePhase::Degraded => (true, true, None),
+            RuntimePhase::RepairRequired => {
+                (false, false, Some(RuntimeBlockingReason::RuntimeRepairRequired))
+            }
+            RuntimePhase::NotPrepared | RuntimePhase::Extracting => {
+                (false, false, Some(RuntimeBlockingReason::RuntimeNotPrepared))
+            }
+        }
     }
 
     async fn start_runtime_locked(&self, settings: &AppSettings) -> Result<String> {
@@ -650,7 +861,27 @@ impl EmbeddedLlamaCppProvider {
         let selected_model = Self::catalog_model(&manifest, &settings.selected_model)?;
         let binary_path = inspection.engine_path.clone();
         let model_path = self.model_target_path(selected_model);
-        let port = self.select_free_port()?;
+        let llama_port = self.select_free_port()?;
+        let proxy_port = self.select_free_port()?;
+        let stderr_log_path = self.runtime_stderr_log_path(llama_port);
+        if let Some(parent) = stderr_log_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let stderr_log = File::create(&stderr_log_path).with_context(|| {
+            format!(
+                "Kunne ikke opprette runtime-logg på {}",
+                stderr_log_path.display()
+            )
+        })?;
+        info!(
+            model_id = %settings.selected_model,
+            llama_port,
+            proxy_port,
+            binary_path = %binary_path.display(),
+            model_path = %model_path.display(),
+            stderr_log_path = %stderr_log_path.display(),
+            "starter lokal runtime"
+        );
 
         let mut child = Command::new(&binary_path)
             .arg("-m")
@@ -660,13 +891,15 @@ impl EmbeddedLlamaCppProvider {
             .arg("--host")
             .arg("127.0.0.1")
             .arg("--port")
-            .arg(port.to_string())
+            .arg(llama_port.to_string())
             .arg("--ctx-size")
-            .arg("4096")
+            .arg(LOCAL_RUNTIME_CTX_SIZE)
             .arg("--api-key")
             .arg(LOCAL_API_KEY)
+            // Skip llama.cpp's empty warm-up run so first startup becomes deterministic in packaged builds.
+            .arg("--no-warmup")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr_log))
             .spawn()
             .with_context(|| {
                 format!(
@@ -675,20 +908,41 @@ impl EmbeddedLlamaCppProvider {
                 )
             })?;
 
-        if let Err(error) = self.wait_for_health(port).await {
+        if let Err(error) = self
+            .wait_for_health(llama_port, &mut child, &stderr_log_path)
+            .await
+        {
+            warn!(model_id = %settings.selected_model, llama_port, error = %error, "lokal runtime ble ikke frisk i tide");
             let _ = cleanup_child(&mut child).await;
             return Err(error);
         }
 
+        let proxy = match start_responses_proxy(
+            proxy_port,
+            format!("http://127.0.0.1:{llama_port}/v1"),
+            LOCAL_API_KEY.to_string(),
+            settings.selected_model.clone(),
+        )
+        .await
+        {
+            Ok(proxy) => proxy,
+            Err(error) => {
+                let _ = cleanup_child(&mut child).await;
+                return Err(error);
+            }
+        };
+
         let mut guard = self.managed_runtime.lock().await;
         *guard = Some(ManagedRuntime {
             child,
-            port,
+            port: proxy.port(),
+            _llama_port: llama_port,
             model_id: settings.selected_model.clone(),
+            proxy,
         });
 
         Ok(format!(
-            "Startet lokal llama.cpp-runtime på http://127.0.0.1:{port}/v1"
+            "Startet lokal llama.cpp-runtime på http://127.0.0.1:{llama_port}/v1 og responses-proxy på http://127.0.0.1:{proxy_port}/v1"
         ))
     }
 }
@@ -708,15 +962,18 @@ impl LocalModelProvider for EmbeddedLlamaCppProvider {
         };
 
         if let Ok(ref inspection) = inspection {
+            let runtime_state =
+                self.runtime_state_for(inspection, &settings.selected_model, local_running);
+            let (can_send, will_start_on_demand, blocking_reason) =
+                self.readiness_for(&runtime_state, codex_available);
             RuntimeStatus {
                 offline_mode: true,
                 local_only: true,
                 selected_model: settings.selected_model.clone(),
-                runtime_state: self.runtime_state_for(
-                    inspection,
-                    &settings.selected_model,
-                    local_running,
-                ),
+                runtime_state,
+                can_send,
+                will_start_on_demand,
+                blocking_reason,
                 codex: RuntimeComponentStatus {
                     available: codex_available,
                     running: false,
@@ -739,6 +996,13 @@ impl LocalModelProvider for EmbeddedLlamaCppProvider {
                 local_only: true,
                 selected_model: settings.selected_model.clone(),
                 runtime_state: RuntimePhase::RepairRequired,
+                can_send: false,
+                will_start_on_demand: false,
+                blocking_reason: Some(if codex_available {
+                    RuntimeBlockingReason::RuntimeStartFailed
+                } else {
+                    RuntimeBlockingReason::CodexUnavailable
+                }),
                 codex: RuntimeComponentStatus {
                     available: codex_available,
                     running: false,
@@ -763,6 +1027,7 @@ impl LocalModelProvider for EmbeddedLlamaCppProvider {
 
     async fn prepare_runtime(&self, settings: &AppSettings) -> Result<String> {
         let _lifecycle = self.lifecycle_gate.lock().await;
+        info!(model_id = %settings.selected_model, "klargjør lokal runtime");
         let copied = self.prepare_runtime_files(&settings.selected_model, false)?;
         let inspection = self.inspect_runtime()?;
         let selected_model = inspection
@@ -781,7 +1046,7 @@ impl LocalModelProvider for EmbeddedLlamaCppProvider {
             )
         } else {
             format!(
-                "Runtime-mappen er klargjort i {}, men den valgte modellpakken er ikke installert ennå. Legg inn ekte llama.cpp- og modellfiler eller bruk miljøvariablene for lokal test.",
+                "Runtime-mappen er klargjort i {}, men standardmodellen er ikke installert ennå. Stag ekte release-artefakter eller bruk utvikler-overstyringer i debug-bygg.",
                 inspection.runtime_home.display()
             )
         };
@@ -797,13 +1062,12 @@ impl LocalModelProvider for EmbeddedLlamaCppProvider {
     async fn healthcheck(&self, settings: &AppSettings) -> Result<String> {
         let Some((port, model_id)) = self.current_runtime_snapshot().await else {
             bail!(
-                "Lokal runtime kjører ikke akkurat nå for {}",
-                settings.selected_model
+                "Lokal runtime kjører ikke akkurat nå for standardmodellen."
             );
         };
 
         if model_id != settings.selected_model {
-            bail!("Lokal runtime kjører, men med en annen modell enn den valgte.")
+            bail!("Lokal runtime kjører, men med en annen modell enn v1-standardmodellen.")
         }
 
         if self.healthcheck_port(port).await {
@@ -821,6 +1085,10 @@ impl LocalModelProvider for EmbeddedLlamaCppProvider {
     }
 
     async fn activate_model(&self, model: &str) -> Result<String> {
+        if model != DEFAULT_MODEL {
+            bail!("Lokal Skriveflate v1 bruker bare standardmodellen.");
+        }
+
         let inspection = self.inspect_runtime()?;
         let Some((catalog, model_inspection)) = inspection
             .models
@@ -840,11 +1108,12 @@ impl LocalModelProvider for EmbeddedLlamaCppProvider {
             );
         }
 
-        Ok(format!("Aktiverte {}", catalog.label))
+        Ok(format!("{} er allerede aktiv som standardmodell.", catalog.label))
     }
 
     async fn repair_runtime(&self, settings: &AppSettings) -> Result<String> {
         let _lifecycle = self.lifecycle_gate.lock().await;
+        info!(model_id = %settings.selected_model, "reparerer lokal runtime");
         self.stop_runtime_locked().await?;
         let copied = self.prepare_runtime_files(&settings.selected_model, true)?;
         let inspection = self.inspect_runtime()?;
@@ -876,6 +1145,16 @@ impl LocalModelProvider for EmbeddedLlamaCppProvider {
         };
         Ok(format!("http://127.0.0.1:{port}/v1"))
     }
+
+    async fn shutdown(&self) -> Result<()> {
+        let _lifecycle = self.lifecycle_gate.lock().await;
+        info!("stopper lokal runtime ved app-avslutning");
+        self.stop_runtime_locked().await
+    }
+}
+
+fn default_manifest_schema_version() -> u32 {
+    1
 }
 
 async fn cleanup_child(child: &mut Child) -> Result<()> {
@@ -914,24 +1193,31 @@ mod tests {
     }
 
     #[test]
-    fn prepare_runtime_files_skips_missing_optional_model() {
+    fn prepare_runtime_files_copies_single_blessed_model() {
         let resource_root = temp_dir("resources");
         let app_data_root = temp_dir("app");
         let engine_bytes = b"engine";
+        let dylib_bytes = b"lib";
         let standard_bytes = b"standard";
 
         write_file(
-            &resource_root.join("embedded-runtime/bin/llama-server"),
+            &resource_root.join("embedded-runtime/staged/llama-server"),
             engine_bytes,
         );
         write_file(
-            &resource_root.join("embedded-runtime/models/qwen3-4b-instruct-q4_k_m.gguf"),
+            &resource_root.join("embedded-runtime/staged/lib/libllama.0.dylib"),
+            dylib_bytes,
+        );
+        write_file(
+            &resource_root.join("embedded-runtime/staged/neurologg-q4_k_m.gguf"),
             standard_bytes,
         );
 
         let manifest = serde_json::json!({
+            "schema_version": 1,
+            "bundle_version": "0.1.0",
             "engine": {
-                "resource": "embedded-runtime/bin/llama-server",
+                "resource": "embedded-runtime/staged/llama-server",
                 "target_name": "llama-server",
                 "sha256": sha(engine_bytes),
                 "placeholder": false
@@ -941,20 +1227,10 @@ mod tests {
                     "id": DEFAULT_MODEL,
                     "label": "Standard",
                     "tier": "Standard",
-                    "resource": "embedded-runtime/models/qwen3-4b-instruct-q4_k_m.gguf",
-                    "filename": "qwen3-4b-instruct-q4_k_m.gguf",
+                    "resource": "embedded-runtime/staged/neurologg-q4_k_m.gguf",
+                    "filename": "neurologg-q4_k_m.gguf",
                     "sha256": sha(standard_bytes),
                     "bundled": true,
-                    "placeholder": false
-                },
-                {
-                    "id": QUALITY_MODEL,
-                    "label": "Quality",
-                    "tier": "Bedre kvalitet",
-                    "resource": "embedded-runtime/models/qwen3-8b-instruct-q4_k_m.gguf",
-                    "filename": "qwen3-8b-instruct-q4_k_m.gguf",
-                    "sha256": sha(b"optional"),
-                    "bundled": false,
                     "placeholder": false
                 }
             ]
@@ -974,27 +1250,13 @@ mod tests {
             .prepare_runtime_files(DEFAULT_MODEL, false)
             .unwrap();
         let inspection = provider.inspect_runtime().unwrap();
+        let dylib_target = provider.runtime_home().join("lib/libllama.0.dylib");
 
-        assert_eq!(copied, 2);
+        assert_eq!(copied, 3);
         assert!(inspection.engine.installed);
-        assert!(
-            inspection
-                .models
-                .iter()
-                .find(|(model, _)| model.id == DEFAULT_MODEL)
-                .unwrap()
-                .1
-                .installed
-        );
-        assert!(
-            !inspection
-                .models
-                .iter()
-                .find(|(model, _)| model.id == QUALITY_MODEL)
-                .unwrap()
-                .1
-                .installed
-        );
+        assert_eq!(inspection.models.len(), 1);
+        assert!(inspection.models[0].1.installed);
+        assert_eq!(fs::read(dylib_target).unwrap(), dylib_bytes);
     }
 
     #[test]

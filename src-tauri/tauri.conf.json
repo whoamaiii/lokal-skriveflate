@@ -27,8 +27,14 @@
   },
   "bundle": {
     "active": true,
+    "externalBin": [
+      "binaries/codex",
+      "binaries/llama-server"
+    ],
     "resources": [
-      "resources/embedded-runtime/**/*"
+      "resources/embedded-runtime/manifest.json",
+      "resources/embedded-runtime/staged/llama-server",
+      "resources/embedded-runtime/staged/*.gguf"
     ],
     "targets": "all",
     "macOS": {

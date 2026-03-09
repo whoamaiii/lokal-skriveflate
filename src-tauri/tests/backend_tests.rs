@@ -8,6 +8,10 @@ mod agent {
             }
         }
     }
+
+    pub mod responses_proxy {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/agent/responses_proxy.rs"));
+    }
 }
 
 #[path = "../src/models.rs"]

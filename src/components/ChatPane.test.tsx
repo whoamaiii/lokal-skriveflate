@@ -10,6 +10,9 @@ function makeRuntimeStatus(overrides: Partial<RuntimeStatus> = {}): RuntimeStatu
     local_only: true,
     selected_model: "lokal-4b",
     runtime_state: "ready",
+    can_send: true,
+    will_start_on_demand: false,
+    blocking_reason: null,
     codex: {
       available: true,
       running: true,
@@ -76,7 +79,6 @@ function makeChatPaneProps(
     onQuickAction: vi.fn(),
     onPrepareLocalAi: vi.fn(),
     onRepairLocalAi: vi.fn(),
-    onActivateModel: vi.fn(),
     onRefreshRuntime: vi.fn(),
     onRetryRuntimeAction: undefined,
     onActivate: undefined,
@@ -103,6 +105,9 @@ describe("ChatPane", () => {
         {...makeChatPaneProps({
           runtimeStatus: makeRuntimeStatus({
             runtime_state: "not_prepared",
+            can_send: false,
+            will_start_on_demand: false,
+            blocking_reason: "runtime_not_prepared",
             local_ai: {
               available: true,
               running: false,
@@ -157,6 +162,9 @@ describe("ChatPane", () => {
         {...props}
         runtimeStatus={makeRuntimeStatus({
           runtime_state: "repair_required",
+          can_send: false,
+          will_start_on_demand: false,
+          blocking_reason: "runtime_repair_required",
           local_ai: {
             available: true,
             running: false,
@@ -184,6 +192,9 @@ describe("ChatPane", () => {
         {...makeChatPaneProps({
           runtimeStatus: makeRuntimeStatus({
             runtime_state: "repair_required",
+            can_send: false,
+            will_start_on_demand: false,
+            blocking_reason: "runtime_repair_required",
             local_ai: {
               available: true,
               running: false,
@@ -199,10 +210,41 @@ describe("ChatPane", () => {
 
     expect(screen.getByRole("button", { name: "Klargjør lokal AI" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Reparer" })).toBeTruthy();
-    expect(screen.getByLabelText("Modellpakke")).toBeTruthy();
+    expect(screen.getByText("Standardmodell: Lokal 4B")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Prøv igjen" }));
 
     expect(onRetryRuntimeAction).toHaveBeenCalledTimes(1);
+  });
+
+  it("allows sends while the runtime will self-start on demand", () => {
+    const onSend = vi.fn();
+
+    render(
+      <ChatPane
+        {...makeChatPaneProps({
+          prompt: "Skriv videre",
+          onSend,
+          runtimeStatus: makeRuntimeStatus({
+            runtime_state: "degraded",
+            can_send: true,
+            will_start_on_demand: true,
+            blocking_reason: null,
+            local_ai: {
+              available: true,
+              running: false,
+              details: "Starter ved første forespørsel.",
+            },
+          }),
+        })}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Send til lokal motor" }));
+
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(
+      screen.getByText("Lokal AI starter ved første forespørsel"),
+    ).toBeTruthy();
   });
 });

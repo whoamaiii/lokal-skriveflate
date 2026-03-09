@@ -14,8 +14,9 @@ use uuid::Uuid;
 use crate::{
     export::render_text_pdf,
     models::{
-        AppSettings, AppStateFile, DocumentSnapshot, DocumentSummary, ExportResult, OutputFormat,
-        PersistedDocument, SaveDocumentRequest, StoredDocument, WorkspaceSnapshot,
+        AppSettings, AppStateFile, DocumentSnapshot, DocumentSummary, ExportResult,
+        OutputFormat, PersistedDocument, SaveDocumentRequest, StoredDocument, WorkspaceSnapshot,
+        APP_STATE_SCHEMA_VERSION, DEFAULT_MODEL, DOCUMENT_SCHEMA_VERSION,
     },
 };
 
@@ -101,6 +102,7 @@ impl StorageService {
 
         let timestamp = now_iso();
         let document = PersistedDocument {
+            schema_version: DOCUMENT_SCHEMA_VERSION,
             id: Uuid::new_v4().to_string(),
             title: title.unwrap_or_else(|| "Nytt lokalt dokument".to_string()),
             content: json!({
@@ -130,11 +132,7 @@ impl StorageService {
                 "Lokalt dokument opprettet. AI-forslag går alltid via preview.",
             )],
             snapshots: Vec::new(),
-            workflow_hints: vec![
-                "skriveassistent".to_string(),
-                "rapport".to_string(),
-                "prosjekt".to_string(),
-            ],
+            workflow_hints: vec!["skriveassistent".to_string()],
             content_revision: 0,
         };
 
@@ -277,6 +275,7 @@ impl StorageService {
     pub fn save_settings(&self, settings: AppSettings) -> Result<AppSettings> {
         let _guard = self.gate.lock().unwrap();
         let StateReadResult { mut state, .. } = self.read_state_locked()?;
+        let settings = normalize_settings(settings);
         state.settings = settings.clone();
         self.write_state_locked(&state)?;
         Ok(settings)
@@ -310,6 +309,7 @@ impl StorageService {
         if documents.is_empty() {
             let timestamp = now_iso();
             let document = PersistedDocument {
+                schema_version: DOCUMENT_SCHEMA_VERSION,
                 id: Uuid::new_v4().to_string(),
                 title: "Velkommen til Lokal Skriveflate".to_string(),
                 content: json!({
@@ -350,11 +350,7 @@ impl StorageService {
                     assistant_message("Be meg om å skrive videre, forbedre markert tekst eller lage et rapportutkast."),
                 ],
                 snapshots: Vec::new(),
-                workflow_hints: vec![
-                    "skriveassistent".to_string(),
-                    "rapport".to_string(),
-                    "logg".to_string(),
-                ],
+                workflow_hints: vec!["skriveassistent".to_string()],
                 content_revision: 0,
             };
 
@@ -410,7 +406,13 @@ impl StorageService {
             };
 
             match serde_json::from_str::<PersistedDocument>(&raw) {
-                Ok(document) => documents.push(document),
+                Ok(mut document) => {
+                    let changed = normalize_document(&mut document);
+                    if changed {
+                        self.write_document_locked(&document)?;
+                    }
+                    documents.push(document);
+                }
                 Err(error) => recovery_notices.push(self.quarantine_corrupt_file(
                     &path,
                     &format!("Kunne ikke lese dokumentet som gyldig JSON: {error}"),
@@ -428,7 +430,11 @@ impl StorageService {
         let path = self.document_path(document_id);
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("Kunne ikke lese dokumentet {}", path.display()))?;
-        Ok(serde_json::from_str(&raw)?)
+        let mut document = serde_json::from_str::<PersistedDocument>(&raw)?;
+        if normalize_document(&mut document) {
+            self.write_document_locked(&document)?;
+        }
+        Ok(document)
     }
 
     fn write_document_locked(&self, document: &PersistedDocument) -> Result<()> {
@@ -458,10 +464,16 @@ impl StorageService {
         };
 
         match serde_json::from_str::<AppStateFile>(&raw) {
-            Ok(state) => Ok(StateReadResult {
-                state,
-                recovery_notices: Vec::new(),
-            }),
+            Ok(mut state) => {
+                let (changed, recovery_notices) = normalize_state(&mut state);
+                if changed {
+                    self.write_state_locked(&state)?;
+                }
+                Ok(StateReadResult {
+                    state,
+                    recovery_notices,
+                })
+            }
             Err(error) => Ok(StateReadResult {
                 state: AppStateFile::default(),
                 recovery_notices: vec![self.quarantine_corrupt_file(
@@ -587,6 +599,47 @@ fn extend_notices(target: &mut Vec<String>, notices: Vec<String>) {
             target.push(notice);
         }
     }
+}
+
+fn normalize_document(document: &mut PersistedDocument) -> bool {
+    let mut changed = false;
+
+    if document.schema_version != DOCUMENT_SCHEMA_VERSION {
+        document.schema_version = DOCUMENT_SCHEMA_VERSION;
+        changed = true;
+    }
+
+    changed
+}
+
+fn normalize_settings(mut settings: AppSettings) -> AppSettings {
+    if settings.selected_model != DEFAULT_MODEL {
+        settings.selected_model = DEFAULT_MODEL.to_string();
+    }
+
+    settings
+}
+
+fn normalize_state(state: &mut AppStateFile) -> (bool, Vec<String>) {
+    let mut recovery_notices = Vec::new();
+    let mut changed = false;
+
+    if state.schema_version != APP_STATE_SCHEMA_VERSION {
+        state.schema_version = APP_STATE_SCHEMA_VERSION;
+        changed = true;
+    }
+
+    let normalized_settings = normalize_settings(state.settings.clone());
+    if normalized_settings.selected_model != state.settings.selected_model {
+        recovery_notices.push(
+            "Oppdaterte lokale innstillinger til v1-standardmodellen for denne utgaven."
+                .to_string(),
+        );
+        changed = true;
+    }
+    state.settings = normalized_settings;
+
+    (changed, recovery_notices)
 }
 
 fn now_iso() -> String {

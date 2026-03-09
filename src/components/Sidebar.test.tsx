@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { Sidebar } from "./Sidebar";
-import type { DocumentSummary, StoredDocument, WorkflowModule } from "../types";
+import type { DocumentSummary, StoredDocument } from "../types";
 import type { ToolbarActionId } from "./editorToolbar";
 
 const activeDocument: StoredDocument = {
@@ -52,27 +52,11 @@ const documents: DocumentSummary[] = [
   },
 ];
 
-const workflows: WorkflowModule[] = [
-  {
-    id: "wf-1",
-    name: "Rapportflyt",
-    description: "Planlagt modul for rapportmaler og kvalitetssikret struktur.",
-    status: "planned",
-  },
-  {
-    id: "wf-2",
-    name: "Prosjektflyt",
-    description: "Aktiv modul for prosjektplaner og oppfolging.",
-    status: "active",
-  },
-];
-
 function makeSidebarProps() {
   return {
     documents,
     activeDocument,
     activeTab: "documents" as const,
-    workflows,
     recoveryNotices: [],
     wordCount: 12,
     selection: {
@@ -146,12 +130,19 @@ describe("Sidebar", () => {
     expect(props.onExport).toHaveBeenCalledWith("txt");
   });
 
-  it("renders workflow rows with the correct status labels in the modules tab", () => {
-    render(<Sidebar {...makeSidebarProps()} activeTab="modules" />);
+  it("shows document-level AI preview indicators without exposing workflow tabs", () => {
+    render(
+      <Sidebar
+        {...makeSidebarProps()}
+        previewStateByDocumentId={{
+          "doc-1": "stale",
+          "doc-2": "ready",
+        }}
+      />,
+    );
 
-    expect(screen.getByText("Rapportflyt")).toBeTruthy();
-    expect(screen.getByText("Prosjektflyt")).toBeTruthy();
-    expect(screen.getByText("Planlagt")).toBeTruthy();
-    expect(screen.getByText("Aktiv")).toBeTruthy();
+    expect(screen.queryByRole("tab", { name: "Moduler" })).toBeNull();
+    expect(screen.getByText("AI-forslag utdatert")).toBeTruthy();
+    expect(screen.getByText("AI-forslag klart")).toBeTruthy();
   });
 });

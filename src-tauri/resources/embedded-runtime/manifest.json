@@ -1,30 +1,28 @@
 {
+  "schema_version": 1,
+  "bundle_version": "0.1.0",
+  "codex": {
+    "sidecar_name": "codex",
+    "sha256": "fe67e505f01246a5b43d493a8f9b5b6146d9b0361075e18440b88178b18c1d87",
+    "placeholder": false
+  },
   "engine": {
-    "resource": "embedded-runtime/bin/llama-server",
+    "sidecar_name": "llama-server",
+    "resource": "embedded-runtime/staged/llama-server",
     "target_name": "llama-server",
-    "sha256": "59f24b9a4bf924a4c7de39aa2357ccfb9a9f20b17fa45e64e50da27ef9e8ff30",
-    "placeholder": true
+    "sha256": "5b763c8f8f8ef7e15b3e6d03946462dd35e2fb732974b3fbc87a4fe1c929e993",
+    "placeholder": false
   },
   "models": [
     {
-      "id": "qwen3-4b-instruct-q4_k_m",
-      "label": "Qwen3-4B-Instruct Q4_K_M",
+      "id": "neurologg-q4_k_m",
+      "label": "Neurologg Q4_K_M",
       "tier": "Standard",
-      "resource": "embedded-runtime/models/qwen3-4b-instruct-q4_k_m.gguf",
-      "filename": "qwen3-4b-instruct-q4_k_m.gguf",
-      "sha256": "d9e714c499873ce224dbeb0933239a508de4c92db9540a5d024243d4c0b7f82c",
+      "filename": "neurologg-q4_k_m.gguf",
+      "resource": "embedded-runtime/staged/neurologg-q4_k_m.gguf",
+      "sha256": "8ea018ba998f82962624213cf18172651bf002e2a899a10994e166355fff23f4",
       "bundled": true,
-      "placeholder": true
-    },
-    {
-      "id": "qwen3-8b-instruct-q4_k_m",
-      "label": "Qwen3-8B-Instruct Q4_K_M",
-      "tier": "Bedre kvalitet",
-      "resource": "embedded-runtime/models/qwen3-8b-instruct-q4_k_m.gguf",
-      "filename": "qwen3-8b-instruct-q4_k_m.gguf",
-      "sha256": "b293553327a04ee0d192ef0d1836c73181f0beea1907759527125a979e287dda",
-      "bundled": false,
-      "placeholder": true
+      "placeholder": false
     }
   ]
 }

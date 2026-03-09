@@ -4,6 +4,7 @@ import type {
   AppSettings,
   AssistantTurnInput,
   AssistantTurnResult,
+  CommandError,
   ExportResult,
   OutputFormat,
   RuntimeActionResult,
@@ -37,12 +38,68 @@ function hasTauriRuntime() {
   return typeof maybeWindow.__TAURI_INTERNALS__?.invoke === "function";
 }
 
+function isCommandError(value: unknown): value is CommandError {
+  return Boolean(
+    value &&
+      typeof value === "object" &&
+      "code" in value &&
+      "message" in value &&
+      "retryable" in value,
+  );
+}
+
+function normalizeCommandError(error: unknown): CommandError {
+  if (isCommandError(error)) {
+    return error;
+  }
+
+  if (error instanceof Error && error.message.trim()) {
+    return {
+      code: "unknown",
+      message: error.message,
+      retryable: false,
+      action: null,
+    };
+  }
+
+  if (typeof error === "string" && error.trim()) {
+    return {
+      code: "unknown",
+      message: error,
+      retryable: false,
+      action: null,
+    };
+  }
+
+  return {
+    code: "unknown",
+    message: "Ukjent feil fra lokal kommando.",
+    retryable: false,
+    action: null,
+  };
+}
+
+async function invokeCommand<T>(
+  command: string,
+  args?: Record<string, unknown>,
+): Promise<T> {
+  try {
+    if (typeof args === "undefined") {
+      return await invoke<T>(command);
+    }
+
+    return await invoke<T>(command, args);
+  } catch (error) {
+    throw normalizeCommandError(error);
+  }
+}
+
 export function bootstrapApp() {
   if (!hasTauriRuntime()) {
     return Promise.resolve(bootstrapBrowserPreview());
   }
 
-  return invoke<AppBootstrap>("bootstrap");
+  return invokeCommand<AppBootstrap>("bootstrap");
 }
 
 export function createDocument(title?: string) {
@@ -50,7 +107,7 @@ export function createDocument(title?: string) {
     return Promise.resolve(createBrowserPreviewDocument(title));
   }
 
-  return invoke<WorkspaceSnapshot>("create_document", { title });
+  return invokeCommand<WorkspaceSnapshot>("create_document", { title });
 }
 
 export function openDocument(documentId: string) {
@@ -58,7 +115,7 @@ export function openDocument(documentId: string) {
     return Promise.resolve(openBrowserPreviewDocument(documentId));
   }
 
-  return invoke<WorkspaceSnapshot>("open_document", { documentId });
+  return invokeCommand<WorkspaceSnapshot>("open_document", { documentId });
 }
 
 export function saveDocument(document: SaveDocumentInput) {
@@ -66,7 +123,7 @@ export function saveDocument(document: SaveDocumentInput) {
     return Promise.resolve(saveBrowserPreviewDocument(document));
   }
 
-  return invoke<StoredDocument>("save_document", { request: document });
+  return invokeCommand<StoredDocument>("save_document", { request: document });
 }
 
 export function sendAssistantTurn(request: AssistantTurnInput) {
@@ -74,7 +131,7 @@ export function sendAssistantTurn(request: AssistantTurnInput) {
     return Promise.resolve(sendBrowserPreviewAssistantTurn(request));
   }
 
-  return invoke<AssistantTurnResult>("send_assistant_turn", { request });
+  return invokeCommand<AssistantTurnResult>("send_assistant_turn", { request });
 }
 
 export function refreshRuntimeStatus() {
@@ -82,7 +139,7 @@ export function refreshRuntimeStatus() {
     return Promise.resolve(refreshBrowserPreviewRuntimeStatus());
   }
 
-  return invoke<RuntimeStatus>("refresh_runtime_status");
+  return invokeCommand<RuntimeStatus>("refresh_runtime_status");
 }
 
 export function prepareLocalAi() {
@@ -90,7 +147,7 @@ export function prepareLocalAi() {
     return Promise.resolve(prepareBrowserPreviewLocalAi());
   }
 
-  return invoke<RuntimeActionResult>("prepare_local_ai");
+  return invokeCommand<RuntimeActionResult>("prepare_local_ai");
 }
 
 export function repairLocalAi() {
@@ -98,7 +155,7 @@ export function repairLocalAi() {
     return Promise.resolve(repairBrowserPreviewLocalAi());
   }
 
-  return invoke<RuntimeActionResult>("repair_local_ai");
+  return invokeCommand<RuntimeActionResult>("repair_local_ai");
 }
 
 export function activateModel(modelId: string) {
@@ -106,7 +163,7 @@ export function activateModel(modelId: string) {
     return Promise.resolve(activateBrowserPreviewModel(modelId));
   }
 
-  return invoke<RuntimeActionResult>("activate_model", { modelId });
+  return invokeCommand<RuntimeActionResult>("activate_model", { modelId });
 }
 
 export function exportDocument(documentId: string, format: OutputFormat) {
@@ -114,7 +171,7 @@ export function exportDocument(documentId: string, format: OutputFormat) {
     return Promise.resolve(exportBrowserPreviewDocument(documentId, format));
   }
 
-  return invoke<ExportResult>("export_document", { documentId, format });
+  return invokeCommand<ExportResult>("export_document", { documentId, format });
 }
 
 export function saveSettings(settings: AppSettings) {
@@ -122,5 +179,5 @@ export function saveSettings(settings: AppSettings) {
     return Promise.resolve(saveBrowserPreviewSettings(settings));
   }
 
-  return invoke<AppSettings>("save_settings", { settings });
+  return invokeCommand<AppSettings>("save_settings", { settings });
 }

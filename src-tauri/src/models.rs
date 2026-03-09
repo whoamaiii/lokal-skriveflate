@@ -1,8 +1,17 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const DEFAULT_MODEL: &str = "qwen3-4b-instruct-q4_k_m";
-pub const QUALITY_MODEL: &str = "qwen3-8b-instruct-q4_k_m";
+pub const DEFAULT_MODEL: &str = "neurologg-q4_k_m";
+pub const DOCUMENT_SCHEMA_VERSION: u32 = 1;
+pub const APP_STATE_SCHEMA_VERSION: u32 = 1;
+
+pub fn default_document_schema_version() -> u32 {
+    DOCUMENT_SCHEMA_VERSION
+}
+
+pub fn default_app_state_schema_version() -> u32 {
+    APP_STATE_SCHEMA_VERSION
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -22,6 +31,8 @@ pub struct DocumentSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedDocument {
+    #[serde(default = "default_document_schema_version")]
+    pub schema_version: u32,
     pub id: String,
     pub title: String,
     pub content: Value,
@@ -112,6 +123,16 @@ pub enum RuntimePhase {
     RepairRequired,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeBlockingReason {
+    CodexUnavailable,
+    RuntimeNotPrepared,
+    RuntimeRepairRequired,
+    RuntimeStartFailed,
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalModelOption {
     pub id: String,
@@ -129,6 +150,9 @@ pub struct RuntimeStatus {
     pub local_only: bool,
     pub selected_model: String,
     pub runtime_state: RuntimePhase,
+    pub can_send: bool,
+    pub will_start_on_demand: bool,
+    pub blocking_reason: Option<RuntimeBlockingReason>,
     pub codex: RuntimeComponentStatus,
     pub local_ai: RuntimeComponentStatus,
     pub available_models: Vec<LocalModelOption>,
@@ -153,6 +177,8 @@ impl Default for AppSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppStateFile {
+    #[serde(default = "default_app_state_schema_version")]
+    pub schema_version: u32,
     pub active_document_id: Option<String>,
     pub settings: AppSettings,
 }
@@ -160,18 +186,11 @@ pub struct AppStateFile {
 impl Default for AppStateFile {
     fn default() -> Self {
         Self {
+            schema_version: APP_STATE_SCHEMA_VERSION,
             active_document_id: None,
             settings: AppSettings::default(),
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowModule {
-    pub id: String,
-    pub name: String,
-    pub description: String,
-    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,7 +207,6 @@ pub struct AppBootstrap {
     pub active_document: StoredDocument,
     pub runtime_status: RuntimeStatus,
     pub settings: AppSettings,
-    pub workflow_modules: Vec<WorkflowModule>,
     #[serde(default)]
     pub recovery_notices: Vec<String>,
 }
@@ -242,6 +260,29 @@ pub struct ExportResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandErrorCode {
+    DocumentConflict,
+    RuntimeNotReady,
+    RuntimeStartFailed,
+    RuntimeRepairRequired,
+    AssistantTimeout,
+    AssistantBridgeError,
+    ExportFailed,
+    StorageError,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandError {
+    pub code: CommandErrorCode,
+    pub message: String,
+    pub retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputFormat {
     Html,
@@ -253,31 +294,6 @@ pub enum OutputFormat {
 pub struct StructuredAssistantResponse {
     pub assistant_reply: String,
     pub editor_action: Option<EditorAction>,
-}
-
-pub fn default_workflows() -> Vec<WorkflowModule> {
-    vec![
-        WorkflowModule {
-            id: "report_workflow".to_string(),
-            name: "Rapportflyt".to_string(),
-            description: "Planlagt modul for rapportmaler og kvalitetssikret struktur.".to_string(),
-            status: "planned".to_string(),
-        },
-        WorkflowModule {
-            id: "log_workflow".to_string(),
-            name: "Loggflyt".to_string(),
-            description: "Planlagt modul for løpende loggføring, dagnotater og dokumentasjon."
-                .to_string(),
-            status: "planned".to_string(),
-        },
-        WorkflowModule {
-            id: "project_workflow".to_string(),
-            name: "Prosjektflyt".to_string(),
-            description: "Planlagt modul for prosjektplaner, møtenotater og oppfølging."
-                .to_string(),
-            status: "planned".to_string(),
-        },
-    ]
 }
 
 pub fn summarize_text(input: &str) -> String {
